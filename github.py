@@ -13,6 +13,7 @@
   CALL_CAP           1 回の取得で使ってよい回数（既定 1500。0 は上限なし）
   NOTIFY             1 なら終わったときに通知する（既定 1）
   SLEEP_DELAYED      予定の時刻（9:00 など）に Mac が眠っていたので、起きてから始めたとき（アプリが渡す）
+  GITHUB_FETCH_WAIT_SCALE  待つ秒数に掛ける値（試しのときだけ 0 にする。既定 1）
 約束: GitHub には書き込まない。外のコマンドは gh_argv_allowed を通ったものだけ
 （gh api --method GET -i [-H If-None-Match: …] <許可した場所> と gh --version）。許可の外は止めて、取得ログに全文を残す。
 """
@@ -49,7 +50,9 @@ DEFAULT_CAP = 1500
 RATE_RESERVE = 300          # GitHub の枠に残しておく回数（設計書 4.7）
 OVERLAP_DAYS = 14           # 取り直しの窓（設計書 4.5）
 ACTIVE_DAYS = 14            # 「動いた」とみなす日数
+WAIT_SCALE = float(os.environ.get("GITHUB_FETCH_WAIT_SCALE") or 1)   # 試しのときだけ 0（待たない）
 RETRY_WAITS = (2, 5, 10)    # 取り直しの間（3 回まで）
+RECHECK_WAIT = 20           # 照合で合わないとき、取り直す前に待つ秒数
 RETRY_AFTER_LIMIT = 600     # retry-after で待つのは、1 回の取得で合わせて 10 分まで
 EVENT_SKIP = {"subscribed", "unsubscribed", "mentioned"}   # 通知の設定にあたる種類は、記録に入れない（設計書 3.3）
 ZERO_SHA = "0" * 40
@@ -350,6 +353,7 @@ class Run:
         self.rate = {}          # core の枠（最後の問い合わせの時点）
         self.waited = 0         # retry-after で待った秒数の合計
         self.incomplete = []    # 取り直しても取れなかった一覧（照合の「ページの取りこぼし」）
+        self.empty_pages = []   # 次のページをたどったのに、取り直しても空だったページ（同じ）
         self.started = utcnow()
 
     # ---- 見張り ----
@@ -399,7 +403,7 @@ class Run:
                     raise Stop("login", "GitHub のログインが切れていた（gh にログインしていない）")
                 last = ("network", err)
                 if attempt < len(RETRY_WAITS):
-                    time.sleep(RETRY_WAITS[attempt])
+                    time.sleep(RETRY_WAITS[attempt] * WAIT_SCALE)
                 continue
             status, headers, body = parsed
             rate = self.note_rate(headers)
@@ -425,7 +429,7 @@ class Run:
                 wait = int(min(65, max(1, (reset - utcnow()).total_seconds() + 1))) if reset else 60
                 self.log.line("検索の枠（1 分あたり）を使い切った。%d 秒待ってから続ける" % wait)
                 self.waited += wait
-                time.sleep(wait)
+                time.sleep(wait * WAIT_SCALE)
                 continue
             if status in (403, 429):
                 low = headers.get("x-ratelimit-remaining") == "0"
@@ -433,7 +437,7 @@ class Run:
                     wait = min(int(headers.get("retry-after", "60") or 60), RETRY_AFTER_LIMIT - self.waited)
                     self.log.line("短い時間に多すぎる、と言われた（retry-after %s 秒）。待ってから続ける" % wait)
                     self.waited += wait
-                    time.sleep(wait)
+                    time.sleep(wait * WAIT_SCALE)
                     continue
                 if low or "rate limit" in body.lower():
                     reset = rate[1]["reset"] if rate else None
@@ -450,7 +454,7 @@ class Run:
                 self.log.line("GitHub の側の不調（%d・%d 回目）: %s" % (status, attempt + 1, where))
                 last = ("server", "GitHub の側が不調だった（%d）" % status)
                 if attempt < len(RETRY_WAITS):
-                    time.sleep(RETRY_WAITS[attempt])
+                    time.sleep(RETRY_WAITS[attempt] * WAIT_SCALE)
                 continue
             if status >= 400:
                 self.log.line("%d の全文: %s → %s" % (status, where, body[:2000]))
@@ -461,7 +465,7 @@ class Run:
                 self.log.line("返事の形が崩れていた（途中で切れた JSON・%d 回目）: %s" % (attempt + 1, where))
                 last = ("server", "返事の形が崩れていた")
                 if attempt < len(RETRY_WAITS):
-                    time.sleep(RETRY_WAITS[attempt])
+                    time.sleep(RETRY_WAITS[attempt] * WAIT_SCALE)
                 continue
             raw_path = self.save_raw(rdir, kind, where, status, headers, data) if save else None
             return Resp(status, headers, body, data, raw_path=raw_path, where=where)
@@ -505,6 +509,16 @@ class Run:
                 saved = read_json(os.path.join(rdir or DATA, prev["raw"]), {}) or {}
                 items, nxt, path, same = saved.get("body"), prev.get("next"), prev["raw"], True
             elif r.status == 200:
+                if n > 1 and r.data == [] and not getattr(r, "_retried", False):
+                    # 前のページの next をたどったのに空だった（GitHub の一時的な不調のことがある）。1 回だけ取り直す
+                    self.log.line("次のページが空で返った（%d ページ目）。1 回だけ取り直す: %s" % (n, where))
+                    time.sleep(RETRY_WAITS[0] * WAIT_SCALE)
+                    r2 = self.get(where, kind, rdir)
+                    if r2.status == 200:
+                        r2._retried = True
+                        r = r2
+                    if r.data == []:
+                        self.empty_pages.append((where, n))
                 items, nxt, path, same = r.data, r.next, os.path.relpath(r.raw_path, rdir or DATA), False
                 pages_bm[where] = {"etag": r.headers.get("etag"), "raw": path, "next": nxt}
             else:
@@ -561,6 +575,9 @@ def fetch_repo(run, cfg, log):
     since_q = iso_z(since)
     facts = {"started": iso_z(run.started), "line": iso_z(line), "since": since_q, "first": first, "incomplete": [],
              "notes": []}
+    before = bm.get("fetch") or {}
+    if before.get("started") == facts["started"]:   # 同じ回の取り直し。先に見つけた取りこぼしは消さない
+        facts["incomplete"] = list(before.get("incomplete") or [])
     try:
         return _fetch_repo(run, cfg, log, rdir, bm, rid, base, P, start, first, line, since, since_q, facts)
     finally:
@@ -574,6 +591,9 @@ def _fetch_repo(run, cfg, log, rdir, bm, rid, base, P, start, first, line, since
 
     def need(pages_bad, what):
         out, bad = pages_bad
+        while run.empty_pages:
+            where, n = run.empty_pages.pop(0)
+            facts["incomplete"].append("%s（%d ページ目が空で返った）" % (what, n))
         if bad is not None:
             if bad.status == 404:
                 raise RepoError("not_found", "%s が見えません（権限が無いか、名前が変わったか、消えた）" % what)
@@ -703,10 +723,15 @@ def _fetch_repo(run, cfg, log, rdir, bm, rid, base, P, start, first, line, since
 
     facts["ended"] = iso_z(utcnow())
     bm["fetch"] = facts
-    bm["last_success"] = iso_z(run.started)
-    spans = bm.setdefault("spans", [])
-    spans.append([iso_z(since if not first else start), iso_z(run.started)])
-    bm["spans"] = merge_spans(spans)
+    if facts["incomplete"]:
+        # 取りこぼしがあった回は、「最後にうまく取れた時刻」と取った期間を進めない。次の回が同じ所から読み直す
+        # （前に取ったページは 304 で安い。GitHub が直っていれば、取りこぼした分を取り戻せる）
+        log.line("  取りこぼしがあったので、次の回も同じ所から読み直します: %s" % "・".join(facts["incomplete"]))
+    else:
+        bm["last_success"] = iso_z(run.started)
+        spans = bm.setdefault("spans", [])
+        spans.append([iso_z(since if not first else start), iso_z(run.started)])
+        bm["spans"] = merge_spans(spans)
     write_json(bm_path(rdir), bm)
     return facts
 
@@ -793,6 +818,16 @@ def load_raw(rdir, kinds=None):
     for v in out.values():
         v.sort(key=lambda x: (x[0].get("fetched_at") or "", x[2]))
     out["_broken"] = broken
+    return out
+
+
+def broken_raws(rdir):
+    """読めない原本（形の崩れた JSON・添える情報が無いもの）の場所。照合の「原本の形」"""
+    out = []
+    for path in glob.glob(os.path.join(rdir, "原本", "*", "*", "*.json")):
+        d = read_json(path)
+        if not isinstance(d, dict) or not isinstance(d.get("meta"), dict):
+            out.append(os.path.relpath(path, rdir))
     return out
 
 
@@ -1441,7 +1476,7 @@ def check_repo(cfg, built=None):
     # 原本の形
     broken = (built or {}).get("broken")
     if broken is None:
-        broken = load_raw(rdir, {"__none__"}).get("_broken") or []
+        broken = broken_raws(rdir)
     if broken:
         ng["原本の形"].append("%s: 読めない原本が %d 個" % (tag, len(broken)))
     return ng, notes, stat
@@ -1747,8 +1782,8 @@ def fetch_all(repos, run, log, cap):
                     refetch_comments(run, c, fixc[int(c["id"])])
                     built[int(c["id"])] = build_records(c)
             if again:
-                log.line("照合で合わないものがあったので、20 秒待って 1 回だけ取り直します（%s）" % "・".join(c.get("tag") for c in again))
-                time.sleep(20)
+                log.line("照合で合わないものがあったので、%d 秒待って 1 回だけ取り直します（%s）" % (RECHECK_WAIT, "・".join(c.get("tag") for c in again)))
+                time.sleep(RECHECK_WAIT * WAIT_SCALE)
                 for c in again:
                     fetch_repo(run, c, log)
                     built[int(c["id"])] = build_records(c)
