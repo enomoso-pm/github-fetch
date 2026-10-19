@@ -1,0 +1,8 @@
+{
+ "checked": "2026-10-18（下書き。実装のときに開いて確かめる）",
+ "gh_install": "https://cli.github.com/",
+ "gh_login": "https://cli.github.com/manual/gh_auth_login",
+ "sso": "https://docs.github.com/en/authentication/authenticating-with-saml-single-sign-on/about-authentication-with-saml-single-sign-on",
+ "authorized_apps": "https://github.com/settings/applications",
+ "rate_limit": "https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api"
+}
