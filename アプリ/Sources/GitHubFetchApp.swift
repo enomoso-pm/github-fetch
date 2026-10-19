@@ -1810,8 +1810,8 @@ struct StatePill: View {
 struct LandedLegend: View {
     var body: some View {
         HStack(spacing: 14) {
-            item(.barPR, "PR 経由（PR のマージで入った）")
-            item(.barDirect, "直接（PR を通らずに push された）")
+            item(.barPR, "PR 経由（PR 1 件で 1）")
+            item(.barDirect, "直接（コミット 1 つで 1）")
         }
         .font(.system(size: 11)).foregroundStyle(Color.ink2)
     }
@@ -2790,7 +2790,7 @@ struct StatusContent: View {
                     Text(Fmt.number(store.totalLanded)).monospacedDigit().foregroundStyle(Color.ink2)
                 }
             }
-            Text("基準のブランチに入った時刻で数えています。PR のマージで入ったものと、PR を通らずに push されたものに分けています。「合計」は取り始めた日から")
+            Text("基準のブランチに入った時刻（日本時間の日）で数えています。PR 経由は PR の数（中のコミットの数ではありません）。直接はコミットの数（マージのコミットは数えません）。「合計」は取り始めた日から")
                 .font(.system(size: 11)).foregroundStyle(Color.ink3).frame(width: 440, alignment: .leading)
                 .fixedSize(horizontal: false, vertical: true)
         }
