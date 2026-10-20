@@ -1469,11 +1469,11 @@ def pending_reason(bm, rdir):
     if bm.get("last_success"):
         return None
     if bm.get("filling"):
-        return "古い分を足している途中（%s）" % bm["filling"].get("why")
+        return "古い分を足している途中・%s" % bm["filling"].get("why")
     seen = len(bm.get("pr_seen") or {})
     total = len(read_jsonl(os.path.join(rdir, "記録", "PR.jsonl")))
     if total:
-        return "最初の取得の途中（PR %s / %s 件まで）" % (format(min(seen, total), ","), format(total, ","))
+        return "最初の取得の途中・PR %s / %s 件まで" % (format(min(seen, total), ","), format(total, ","))
     return "最初の取得の途中"
 
 
@@ -1492,7 +1492,7 @@ def check_repo(cfg, built=None, run_start=None):
     if not f:
         return ng, notes, {}, pending_reason(bm, rdir) or "まだ照合の材料が無い"
     if run_start is not None and f.get("started") != run_start:
-        return ng, notes, {}, "今回は途中で止まった（前回の照合は %s の取得）" % short_t(f.get("started"))
+        return ng, notes, {}, "今回は途中で止まった・前回の照合は %s の取得" % short_t(f.get("started"))
     stat = {"checked_at": f.get("started")}
     for n in f.get("notes") or []:   # 取る係の注記（名前が変わっていました・古い分を足しました など）も、照合の注記に出す
         notes.append("%s: %s" % (tag, n))
@@ -1655,7 +1655,7 @@ def run_checks(repos, built_map=None, skip=None, run_start=None):
     for cfg in repos:
         tag = cfg.get("tag") or cfg["name"]
         if cfg["id"] in skip:
-            unverified.append({"repo": tag, "reason": "取れなかった（%s）" % (skip[cfg["id"]] or "理由は取得ログ")})
+            unverified.append({"repo": tag, "reason": "取れなかった・%s" % (skip[cfg["id"]] or "理由は取得ログ")})
             continue
         ng, nt, st, why = check_repo(cfg, (built_map or {}).get(cfg["id"]), run_start)
         if why:

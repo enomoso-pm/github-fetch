@@ -252,7 +252,14 @@ final class Setup: ObservableObject {
         // 調べ終えた見込みを、選んだ一覧にも入れる
         for i in picked.indices {
             if let c = candidates.first(where: { $0.id == picked[i].id }) {
+                let arrived = picked[i].estimate == nil && c.estimate != nil
                 picked[i].estimate = picked[i].estimate ?? c.estimate
+                // 見込みはチェックのあとで届く。届いたときに、人がまだ取り始める日を変えていなければ、
+                // 大きいリポジトリは「90日前から」に選び直す（設計書 4.9。前は、届く前にしか選ばなかった）
+                if arrived, picked[i].fromKind == .created, let all = c.estimate?.all, all > Setup.callCap {
+                    picked[i].fromKind = .days90
+                    picked[i].from = Calendar.current.date(byAdding: .day, value: -90, to: Date())
+                }
                 picked[i].hint = picked[i].hint ?? c.hint
                 if picked[i].branches.count <= 1, let b = c.branches, !b.isEmpty { picked[i].branches = b }
             }
@@ -1689,6 +1696,19 @@ enum SetupTest {
             s.toggle(s.candidates[1])
             check("見込みが1回の上限を超えるリポジトリは、90日前からになる",
                   s.picked.first { $0.id == 1009 }?.fromKind == .days90)
+            // 見込みがチェックのあとで届いても、大きいリポジトリは「90日前から」に選び直す（レビュー 4 回目 P-4）
+            s.candidates.append(RepoCandidate(id: 1011, name: "test-owner/big-later", default_branch: "main", branches: ["main"],
+                                              created: "2020-01-01"))
+            s.toggle(s.candidates[s.candidates.count - 1])
+            let beforeKind = s.picked.first { $0.id == 1011 }?.fromKind
+            try "{\"repos\": [{\"id\": 1011, \"name\": \"test-owner/big-later\", \"created\": \"2020-01-01\", \"estimate\": {\"all\": 9000, \"days90\": 300}}]}"
+                .write(to: Paths.candidates, atomically: true, encoding: .utf8)
+            s.loadCandidates()
+            check("見込みがあとで届いても、大きいリポジトリは90日前からに選び直す（届く前は作った日から）",
+                  beforeKind == .created && s.picked.first { $0.id == 1011 }?.fromKind == .days90)
+            s.candidates = [RepoCandidate(id: 1001, name: "test-owner/one", default_branch: "main", branches: ["main"], created: "2020-01-01"),
+                            RepoCandidate(id: 1009, name: "test-owner/big", default_branch: "main", branches: ["main"],
+                                          created: "2020-01-01", estimate: Estimate(all: 9000, days90: 300))]
             // 既定のブランチが止まっていれば、注意を出し、押すと勧めるブランチになる
             s.candidates.append(RepoCandidate(id: 1010, name: "test-owner/quiet-main", default_branch: "main",
                                               branches: ["main", "develop"], created: "2024-01-01",

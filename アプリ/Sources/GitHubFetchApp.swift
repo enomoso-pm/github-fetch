@@ -225,6 +225,7 @@ struct RunInfo: Codable {
     var wait_until: String?     // 回数の上限で待っているとき、戻る時刻
     var progress: ProgressInfo?
     var repos_failed: [String]?
+    var first_partial: Bool?    // 最初の取得（または古い分を足している途中）で上限に届いた（黄の「最初の取得の途中です」）
 }
 
 /// 取得の途中で Mac が眠っていた間（Slack 取得と同じ形）
@@ -335,9 +336,13 @@ struct RepoInfo: Codable, Identifiable {
     var pr_flags: PRFlags?
     var active: [ActiveItem]?
     var counts: RepoCounts?
+    var complete: Bool?         // 一度でも最後まで読み切ったか（無ければ読み切った扱い。前の版の状態.json）
+    var pending: String?        // 読み切っていない理由（「最初の取得の途中（PR 1,061 / 1,527 件まで）」など）
 
     /// 取れなかった（この回の取得で）
     var failed: Bool { error != nil }
+    /// まだ最後まで取れていない（最初の取得の途中・古い分を足している途中）。画面で「取れています」と出さない
+    var incomplete: Bool { complete == false }
     /// この14日に動いた（入った・PR や issue が動いた）か。動いていなければ、状況ページでは表にまとめる
     func moved(now: Date) -> Bool {
         if (open_prs_active ?? 0) > 0 || (open_issues_active ?? 0) > 0 { return true }
@@ -350,7 +355,15 @@ struct CheckItem: Codable, Identifiable {
     var name: String
     var ok: Bool
     var detail: String
+    var state: String?          // ok・ng・unverified（確かめていない。このとき ok は偽）。前の版の状態.json には無い
     var id: String { name }
+    var unverified: Bool { state == "unverified" }
+}
+
+/// 確かめていないリポジトリと理由（最初の取得の途中・今回は途中で止まった・取れなかった など。設計書 5 章）
+struct UnverifiedRepo: Codable, Hashable {
+    var repo: String
+    var reason: String
 }
 
 struct CheckInfo: Codable {
@@ -358,6 +371,8 @@ struct CheckInfo: Codable {
     var notes: [String]?
     var exceptions: [String]?
     var items: [CheckItem]?
+    var unverified: [UnverifiedRepo]?
+    var checked_at: String?     // 照合の材料を取った回の時刻（数え直しのとき、いつの取得で確かめたか）
 }
 
 /// 日ごとに入った数（呼び名ごと）。pr はそのうち PR 経由の数（直接は counts − pr）
@@ -379,6 +394,7 @@ struct StateFile: Codable {
     var repos: [RepoInfo]?
     var check: CheckInfo?
     var last_success: String?
+    var last_read: String?      // 最後まで読み切った回（ok・ng・partial）の時刻。「古い」はこれで見る
     var daily: [DailyEntry]?
     var auth: AuthInfo?
 }
@@ -456,7 +472,7 @@ enum Fmt {
 // MARK: - 状態と操作
 
 /// 画面に出す状態。fresh: まだ一度も取っていない。login・waiting・partial は GitHub だけ（設計書.md の 6・7.2）
-enum DisplayState { case ok, running, ng, failed, stale, fresh, login, waiting, partial }
+enum DisplayState { case ok, running, ng, failed, filling, stale, fresh, login, waiting, partial }
 
 @MainActor
 final class Store: ObservableObject {
@@ -717,6 +733,9 @@ final class Store: ObservableObject {
     // ---- 表示に使う値 ----
 
     var lastSuccess: Date? { Fmt.parseISO(file.last_success) }
+    /// 最後まで読み切った回の時刻（無ければ最後にうまく取れた時刻）。「古い」はこれで見る（設計書 6 章。
+    /// 1 つのリポジトリが取れないだけ・NG を例外に入れただけで「古い」にしない）
+    var lastRead: Date? { Fmt.parseISO(file.last_read) ?? lastSuccess }
     var lastRunEnd: Date? { Fmt.parseISO(file.run?.end) }
     var lastRunStart: Date? { Fmt.parseISO(file.run?.start) ?? history.first.flatMap { Fmt.parseISO($0.start) } }
 
@@ -726,18 +745,19 @@ final class Store: ObservableObject {
         if file.state == nil && file.run == nil && history.isEmpty { return .fresh }
         switch file.state {
         case "ng": return .ng
+        case "stopped" where file.run?.first_partial == true: return .filling   // 最初の取得の途中（黄。大きいリポジトリのふつうの流れ）
         case "error", "stopped": return .failed
         case "login": return .login
         case "waiting": return .waiting
         default: break
         }
-        if autoEnabled, let ls = lastSuccess, now.timeIntervalSince(ls) > 26 * 3600 { return .stale }
+        if autoEnabled, let ls = lastRead, now.timeIntervalSince(ls) > 26 * 3600 { return .stale }
         if file.state == "partial" { return .partial }
         return .ok
     }
 
     var timeText: String { String(format: "%d:%02d", hour, minute) }
-    var staleDays: Int { max(1, Int(now.timeIntervalSince(lastSuccess ?? now) / 86400)) }
+    var staleDays: Int { max(1, Int(now.timeIntervalSince(lastRead ?? now) / 86400)) }
     /// 「前回の取得から入った」の前回（いま出している数は、この取得からのもの）
     var prevRunEnd: Date? {
         Fmt.parseISO(file.run?.since) ?? (history.count >= 2 ? Fmt.parseISO(history[1].end) : nil)
@@ -780,9 +800,19 @@ final class Store: ObservableObject {
     var callCapText: String { callCap == 0 ? "上限なし" : "\(Fmt.number(callCap)) 回" }
     /// 回数の上限で待っているとき、戻る時刻
     var waitUntil: Date? { Fmt.parseISO(file.run?.wait_until) }
+    /// 照合で確かめていないリポジトリ（最初の取得の途中・今回は途中で止まった など）。あれば照合のタイルを緑にしない
+    var unverified: [UnverifiedRepo] { file.check?.unverified ?? [] }
+    /// まだ最後まで取れていないリポジトリの説明（「whisper.cpp（最初の取得の途中（PR 1,061 / 1,527 件まで））」）
+    var pendingText: String {
+        let p = repos.filter(\.incomplete).map { r in r.tag + (r.pending.map { ": \($0)" } ?? "") }
+        return p.isEmpty ? "" : p.prefix(3).joined(separator: "／") + (p.count > 3 ? "／ほか \(p.count - 3)" : "")
+    }
 
     /// NG の行を読みやすくする（github.py が呼び名で書くので、頭の「NG 」を外すだけ）
-    func readable(_ line: String) -> String { line.hasPrefix("NG ") ? String(line.dropFirst(3)) : line }
+    func readable(_ line: String) -> String {
+        if line.hasPrefix("NG: ") { return String(line.dropFirst(4)) }   // 前の版の状態.json
+        return line.hasPrefix("NG ") ? String(line.dropFirst(3)) : line
+    }
 
     // ---- Mac のスリープ（表示の言葉。Slack 取得と同じ） ----
 
@@ -817,7 +847,7 @@ final class Store: ObservableObject {
 
     /// スリープで取れなかった（途中で眠っていて、うまく終わらなかった）。黄色で出し、もう一度取るよう促す
     var sleepMissed: Bool {
-        (display == .ng || display == .failed) && file.run?.sleep_missed == true && file.run?.sleep != nil
+        (display == .ng || display == .failed || display == .partial) && file.run?.sleep_missed == true && file.run?.sleep != nil
     }
 
     /// スリープで取れなかったときの説明（小窓のカードと、状況ページの見出しの下）
@@ -1195,6 +1225,7 @@ struct Pill: View {
             case "ok": return ("照合 OK", .okInk, .okWash)
             case "ng": return ("照合 NG \(ng ?? 0)件", .ngInk, .ngWash)
             case "stopped": return ("途中で止めた", .warnInk, .warnWash)
+            case "interrupted": return ("途中で終わった", .warnInk, .warnWash)   // 取得中にアプリや Mac が止まった（Slack 版と同じ）
             case "partial": return ("一部取れず", .warnInk, .warnWash)
             case "waiting": return ("回数の待ち", .warnInk, .warnWash)
             case "login": return ("ログインが必要", .ngInk, .ngWash)
@@ -1274,6 +1305,7 @@ struct MenuIcon: View {
         case .running: Image(systemName: "arrow.triangle.2.circlepath")
         case .ng: Image(systemName: "exclamationmark.triangle.fill")
         case .failed: Image(systemName: "exclamationmark.circle.fill")
+        case .filling: Image(systemName: "hourglass")
         case .stale: Image(systemName: "clock.badge.exclamationmark")
         case .fresh: Image(systemName: "tray")
         case .login: Image(systemName: "key.fill")
@@ -1319,6 +1351,7 @@ struct StatusCard: View {
         case .ok: return "checkmark"
         case .running: return "arrow.clockwise"
         case .ng, .failed, .partial: return "exclamationmark"
+        case .filling: return "hourglass"
         case .stale: return "clock"
         case .fresh: return "arrow.down"
         case .login: return "key.fill"
@@ -1331,7 +1364,7 @@ struct StatusCard: View {
         case .ok: return .okInk
         case .running, .fresh: return .key
         case .ng, .failed, .login: return .ngInk
-        case .stale, .waiting, .partial: return .warnIcon
+        case .stale, .waiting, .partial, .filling: return .warnIcon
         }
     }
     private func wash(_ s: DisplayState) -> Color {
@@ -1340,7 +1373,7 @@ struct StatusCard: View {
         case .ok: return .okWash
         case .running, .fresh: return .keyWash
         case .ng, .failed, .login: return .ngWash
-        case .stale, .waiting, .partial: return .warnWash
+        case .stale, .waiting, .partial, .filling: return .warnWash
         }
     }
     private func title(_ s: DisplayState) -> String {
@@ -1350,6 +1383,7 @@ struct StatusCard: View {
         case .running: return "取得中…"
         case .ng: return "照合で合わないものが \(store.ngLines.count)件あります"
         case .failed: return store.file.state == "stopped" ? "途中で止まりました" : "取れませんでした"
+        case .filling: return "最初の取得の途中です"
         case .stale: return "\(store.staleDays)日間 取れていません"
         case .fresh: return "まだ一度も取っていません"
         case .login: return "ログインが必要です"
@@ -1369,8 +1403,11 @@ struct StatusCard: View {
             return "\(last) の取得。ほかは全部 OK です"
         case .failed:
             return "\(last)・\(store.file.run?.note ?? "くわしくは取得ログを見てください")。取れた分は残っています。もう一度動かせば、続きから取ります"
+        case .filling:
+            return "\(store.callCapText)ずつ分けて取ります" + (store.pendingText.isEmpty ? "" : "。いま \(store.pendingText)")
+                + "。\(last) までに取れた分は残っています。続きは次の取得（今すぐ取る・毎朝）で取ります"
         case .stale:
-            return "最後に取れたのは \(Fmt.relative(store.lastSuccess, now: store.now))。Mac が止まっていたか、このアプリが閉じていたかもしれません。次に取れば、その間の分もまとめて取ります（抜けません）"
+            return "最後に取れたのは \(Fmt.relative(store.lastRead, now: store.now))。Mac が止まっていたか、このアプリが閉じていたかもしれません。次に取れば、その間の分もまとめて取ります（抜けません）"
         case .fresh:
             return store.freshText
         case .login:
@@ -1452,7 +1489,7 @@ struct StatusCard: View {
                 DadsButton(title: "詳しく見る", kind: .quiet, small: true, action: openStatus)
             }
             .padding(.top, 6)
-        case .failed:
+        case .failed, .filling:
             HStack(spacing: 8) {
                 DadsButton(title: "今すぐ取る", small: true) { store.runNow() }
                 DadsButton(title: "取得ログを開く", kind: .quiet, small: true) { store.openLatestLog() }
@@ -1569,7 +1606,9 @@ struct RepoList: View {
     /// まとめた行の説明（動きがあるものが混じっていれば、そう言う。取れなかったものは、まとめずに上に出している）
     private func restNote(_ rest: [RepoInfo]) -> String {
         let moving = rest.filter { ($0.last7 ?? 0) > 0 }.count
-        return (moving == 0 ? "この7日は動きなし" : "うち \(moving) つに動きあり") + "・すべて取れています"
+        let pending = rest.filter(\.incomplete).count
+        return (moving == 0 ? "この7日は動きなし" : "うち \(moving) つに動きあり")
+            + (pending == 0 ? "・すべて取れています" : "・\(pending) つはまだ最後まで取れていません")
     }
 }
 
@@ -1797,6 +1836,7 @@ struct StatePill: View {
         case .ng: return ("exclamationmark.triangle.fill", "照合 NG \(store.ngLines.count)件", .ngInk, .ngWash)
         case .failed:
             return ("exclamationmark.circle.fill", store.file.state == "stopped" ? "途中で止まった" : "取れなかった", .ngInk, .ngWash)
+        case .filling: return ("hourglass", "最初の取得の途中", .warnInk, .warnWash)
         case .stale: return ("clock.badge.exclamationmark", "\(store.staleDays)日間 取れていない", .warnInk, .warnWash)
         case .fresh: return ("tray", "まだ取っていない", .key, .keyWash)
         case .login: return ("key.fill", "ログインが必要", .ngInk, .ngWash)
@@ -2168,7 +2208,7 @@ struct RepoPanel: View {
                 stat("PR・issue", "\(Fmt.number(r.counts?.prs ?? 0))・\(Fmt.number(r.counts?.issues ?? 0))")
                 stat("コメント・レビュー", "\(Fmt.number(r.counts?.comments ?? 0))・\(Fmt.number(r.counts?.reviews ?? 0))")
                 stat("最後に入った", lastLanded)
-                stat("最後に取れた", Fmt.relative(Fmt.parseISO(r.fetched), now: now))
+                stat("最後に取れた", r.incomplete ? "まだ最後まで取れていません" : Fmt.relative(Fmt.parseISO(r.fetched), now: now))
             }
         }
         .padding(16)
@@ -2318,8 +2358,10 @@ struct QuietTable: View {
                         Text(r.from.flatMap { Fmt.parseJST($0 + " 12:00:00") }.map { Fmt.string($0, "yyyy/M/d") } ?? "—")
                             .font(.system(size: 12)).monospacedDigit()
                         HStack(spacing: 4) {
-                            Image(systemName: "checkmark.circle.fill").font(.system(size: 11)).foregroundStyle(Color.okInk)
-                            Text("取れています（\(Fmt.relative(Fmt.parseISO(r.fetched), now: now))）")
+                            Image(systemName: r.incomplete ? "hourglass" : "checkmark.circle.fill").font(.system(size: 11))
+                                .foregroundStyle(r.incomplete ? Color.warnInk : Color.okInk)
+                            Text(r.incomplete ? "まだ最後まで取れていません" + (r.pending.map { "（\($0)）" } ?? "")
+                                 : "取れています（\(Fmt.relative(Fmt.parseISO(r.fetched), now: now))）")
                                 .font(.system(size: 11)).foregroundStyle(Color.ink2)
                         }
                     }
@@ -2680,6 +2722,12 @@ struct StatusContent: View {
                        "\(store.file.run?.note ?? "くわしくは取得ログを見てください")。取れた分は残っています。もう一度動かせば、続きから取ります") {
                 EmptyView()
             }
+        case .filling:
+            noticeLine("hourglass", .warnInk,
+                       "最初の取得の途中です。\(store.callCapText)ずつ分けて取ります" + (store.pendingText.isEmpty ? "" : "。いま \(store.pendingText)")
+                           + "。取れた分は残っていて、続きは次の取得（今すぐ取る・毎朝）で取ります") {
+                DadsButton(title: "今すぐ取る", small: true) { store.runNow() }
+            }
         case .login:
             noticeLine("key.fill", .ngInk,
                        "GitHub のログインが切れていました。ターミナルで gh にログインしてから、もう一度取ってください。前のデータは残っています") {
@@ -2697,7 +2745,7 @@ struct StatusContent: View {
             }
         case .stale:
             noticeLine("clock.badge.exclamationmark", .warnInk,
-                       "最後に取れたのは \(Fmt.relative(store.lastSuccess, now: store.now))。Mac が止まっていたか、このアプリが閉じていたかもしれません。次に取れば、その間の分もまとめて取ります（抜けません）") {
+                       "最後に取れたのは \(Fmt.relative(store.lastRead, now: store.now))。Mac が止まっていたか、このアプリが閉じていたかもしれません。次に取れば、その間の分もまとめて取ります（抜けません）") {
                 EmptyView()
             }
         default:
@@ -2754,9 +2802,13 @@ struct StatusContent: View {
             Tile(label: "これから（開いている PR）", value: Fmt.number(store.openPRs),
                  note: "14日で動いた \(Fmt.number(store.openPRsActive))・issue \(Fmt.number(store.openIssues))（動いた \(Fmt.number(store.openIssuesActive))）")
                 .hoverTip(forced: store.previewTip == "open") { openTip }
-            Tile(label: "照合", value: store.ngLines.isEmpty ? "OK" : "NG \(store.ngLines.count)件",
-                 note: store.ngLines.isEmpty ? "\((store.file.check?.items ?? []).count)項目すべて OK・抜けなし" : "見出しの下に理由",
-                 valueColor: store.ngLines.isEmpty ? .okInk : .ngInk)
+            // 確かめていないリポジトリがあれば、緑の「OK・抜けなし」にしない（設計書 5 章）
+            Tile(label: "照合",
+                 value: !store.ngLines.isEmpty ? "NG \(store.ngLines.count)件" : (store.unverified.isEmpty ? "OK" : "確かめていない"),
+                 note: !store.ngLines.isEmpty ? "見出しの下に理由"
+                     : (store.unverified.isEmpty ? "\((store.file.check?.items ?? []).count)項目すべて OK・抜けなし"
+                        : "確かめていない所があります（\(store.unverified.count) リポジトリ）"),
+                 valueColor: !store.ngLines.isEmpty ? .ngInk : (store.unverified.isEmpty ? .okInk : .warnInk))
                 .hoverTip(alignTrailing: true, forced: store.previewTip == "check") { checkTip }
             Tile(label: "使った回数（今回）", value: "\(Fmt.number(store.file.run?.calls ?? 0)) 回",
                  note: "上限 \(store.callCap == 0 ? "なし" : Fmt.number(store.callCap))・枠の残り \(Fmt.number(store.file.run?.rate?.remaining ?? 0))")
@@ -2831,8 +2883,8 @@ struct StatusContent: View {
             VStack(alignment: .leading, spacing: 7) {
                 ForEach(store.file.check?.items ?? []) { i in
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        Image(systemName: i.ok ? "checkmark.circle.fill" : "xmark.circle.fill")
-                            .foregroundStyle(i.ok ? Color.okInk : Color.ngInk)
+                        Image(systemName: i.unverified ? "questionmark.circle.fill" : (i.ok ? "checkmark.circle.fill" : "xmark.circle.fill"))
+                            .foregroundStyle(i.unverified ? Color.warnInk : (i.ok ? Color.okInk : Color.ngInk))
                         VStack(alignment: .leading, spacing: 1) {
                             Text(i.name).bold()
                             Text(i.detail).font(.system(size: 11)).foregroundStyle(Color.ink2)
@@ -2927,7 +2979,7 @@ enum Snapshot {
         Paths.displayAliases = [(Paths.data.path, "~/" + Paths.dataFolderName)]
         if let b = args["baseDir"] as? String, !b.isEmpty { Paths.displayAliases.append((b, "~/github-fetch")) }
         defer { Paths.displayHome = nil; Paths.displayAliases = [] }
-        let states: [(String, DisplayState)] = [("ok", .ok), ("running", .running), ("ng", .ng), ("failed", .failed),
+        let states: [(String, DisplayState)] = [("ok", .ok), ("running", .running), ("ng", .ng), ("failed", .failed), ("filling", .filling),
                                                 ("stale", .stale), ("fresh", .fresh), ("login", .login),
                                                 ("waiting", .waiting), ("partial", .partial)]
         for (name, st) in states {
@@ -2978,6 +3030,11 @@ enum Snapshot {
             s.previewTip = tip
             render(StatusContent().environmentObject(s), to: "\(dir)/window_tip_\(tip).png", width: 1000)
         }
+        // 照合の札（最初の取得の途中で、確かめていない所があるとき）
+        let unv = Store(live: false)
+        prepare(unv, .filling)
+        unv.previewTip = "check"
+        render(StatusContent().environmentObject(unv), to: "\(dir)/window_tip_check_unverified.png", width: 1000)
         // 棒にマウスを乗せたとき・取得の記録を全部開いたとき
         let s = Store(live: false)
         s.previewBar = (s.file.daily ?? []).dropLast(2).last.flatMap { Fmt.parseJST($0.date + " 12:00:00") }.map { Fmt.string($0, "M/d") }
@@ -3014,7 +3071,26 @@ enum Snapshot {
             store.file.run?.result = "stopped"
             store.file.run?.note = "1回の上限（1,500 回）に届きました"
             store.file.run?.calls = 1500
+        case .filling:
+            store.file.state = "stopped"
+            store.file.run?.result = "stopped"
+            store.file.run?.note = "1回の上限（1,500 回）に届いた"
+            store.file.run?.calls = 1500
+            store.file.run?.first_partial = true
+            if let i = store.file.repos?.firstIndex(where: { _ in true }) {
+                let tag = store.file.repos?[i].tag ?? "音声"
+                let why = "最初の取得の途中・PR 1,061 / 1,527 件まで"
+                store.file.repos?[i].complete = false
+                store.file.repos?[i].pending = why
+                store.file.check?.unverified = [UnverifiedRepo(repo: tag, reason: why)]
+                for j in (store.file.check?.items ?? []).indices {
+                    store.file.check?.items?[j].ok = false
+                    store.file.check?.items?[j].state = "unverified"
+                    store.file.check?.items?[j].detail = "確かめていない: \(tag)（\(why)）"
+                }
+            }
         case .stale:
+            store.file.last_read = Fmt.iso.string(from: Date().addingTimeInterval(-2 * 86400 - 3600))
             store.file.last_success = Fmt.iso.string(from: Date().addingTimeInterval(-2 * 86400 - 3600))
         case .fresh:
             store.file = StateFile()
