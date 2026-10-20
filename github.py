@@ -13,9 +13,10 @@
   CALL_CAP           1 回の取得で使ってよい回数（既定 1500。0 は上限なし）
   NOTIFY             1 なら終わったときに通知する（既定 1）
   SLEEP_DELAYED      予定の時刻（9:00 など）に Mac が眠っていたので、起きてから始めたとき（アプリが渡す）
-  GITHUB_FETCH_WAIT_SCALE  待つ秒数に掛ける値（試しのときだけ 0 にする。既定 1）
-約束: GitHub には書き込まない。外のコマンドは gh_argv_allowed を通ったものだけ
+  GITHUB_FETCH_WAIT_SCALE  待つ秒数に掛ける値（試しの道具だけが使う。既定 1。0 にすると、GitHub の「待って」を守らなくなる）
+約束: GitHub には書き込まない。GitHub への問い合わせは gh_argv_allowed を通ったものだけ
 （gh api --method GET -i [-H If-None-Match: …] <許可した場所> と gh --version）。許可の外は止めて、取得ログに全文を残す。
+手元のコマンドとして、pmset（Mac の電源の記録）と osascript（通知）も動かす（どちらも GitHub には問い合わせない）。
 """
 import datetime
 import glob
@@ -50,6 +51,8 @@ DEFAULT_CAP = 1500
 RATE_RESERVE = 300          # GitHub の枠に残しておく回数（設計書 4.7）
 OVERLAP_DAYS = 14           # 取り直しの窓（設計書 4.5）
 ACTIVE_DAYS = 14            # 「動いた」とみなす日数
+CI_KEEP_DAYS = 400          # CI の結果が GitHub に残っている目安（約 13 か月）。最初の取得はこの間に動いた PR の CI を聞く（設計書 2.1）
+GHOST_ID = 10137            # 消されたアカウント（ghost）の番号。作者がこれの PR は、検索に出ない（設計書 5 章）
 WAIT_SCALE = float(os.environ.get("GITHUB_FETCH_WAIT_SCALE") or 1)   # 試しのときだけ 0（待たない）
 RETRY_WAITS = (2, 5, 10)    # 取り直しの間（3 回まで）
 RECHECK_WAIT = 20           # 照合で合わないとき、取り直す前に待つ秒数
@@ -226,6 +229,8 @@ def path_allowed(where):
     if not where or where.startswith("/") or "://" in where or "graphql" in where.lower():
         return False
     path, _, query = where.partition("?")
+    if any(seg in (".", "..") for seg in path.split("/")):   # gh がたどって、決めた形の外の場所に届く（設計書 4.2）
+        return False
     if not any(re.fullmatch(p, path) for p, _ in ALLOWED_PATHS):
         return False
     names = {k for k, _ in urllib.parse.parse_qsl(query, keep_blank_values=True)}
@@ -439,11 +444,24 @@ class Run:
                     self.waited += wait
                     time.sleep(wait * WAIT_SCALE)
                     continue
-                if low or "rate limit" in body.lower():
+                if low:
                     reset = rate[1]["reset"] if rate else None
-                    raise Stop("rate", "GitHub の 1 時間あたりの回数を使い切った", wait_until=reset)
+                    # 戻る時刻が分からないとき（見出しが無い返事）も、アプリが自動で続けられるよう 1 時間後にする
+                    raise Stop("rate", "GitHub の 1 時間あたりの回数を使い切った",
+                               wait_until=reset or iso_z(utcnow() + datetime.timedelta(hours=1)))
+                if "rate limit" in body.lower():
+                    # 二つ目の制限（短い時間に多すぎる）。retry-after が無いときは 1 分待つ（設計書 6 章）
+                    if self.waited < RETRY_AFTER_LIMIT:
+                        wait = min(60, RETRY_AFTER_LIMIT - self.waited)
+                        self.log.line("短い時間に問い合わせが多すぎる、と言われた（retry-after なし）。%d 秒待ってから続ける" % wait)
+                        self.waited += wait
+                        time.sleep(wait * WAIT_SCALE)
+                        continue
+                    raise Stop("rate", "短い時間に問い合わせが多すぎると言われた（少し待ってから続きを取る）",
+                               wait_until=iso_z(utcnow() + datetime.timedelta(minutes=15)))
                 self.log.line("%d の全文: %s → %s" % (status, where, body[:2000]))
-                if headers.get("x-github-sso") or "saml" in body.lower() or "sso" in body.lower():
+                # SSO は見出しの X-GitHub-SSO と本文の saml で見分ける（本文の「sso」の並びは associated などに当たる）
+                if headers.get("x-github-sso") or "saml" in body.lower():
                     raise RepoError("sso", "組織の許可（SSO）が要る")
                 raise RepoError("forbidden", "見る権限が無い（403）")
             if status == 404:
@@ -568,22 +586,52 @@ def fetch_repo(run, cfg, log):
     rid, base = int(cfg["id"]), cfg.get("base") or "main"
     P = "repositories/%d" % rid
     start = start_of(cfg)
+    before = bm.get("fetch") or {}
+    same_run = before.get("started") == iso_z(run.started)
+    if not same_run:
+        refill_if_moved(bm, cfg, base, log)
     prev = parse_time(bm.get("last_success"))
-    first = prev is None
-    line = max(start, prev - datetime.timedelta(days=OVERLAP_DAYS)) if prev else start   # 取り直しの窓の線
-    since = max(start, week_start(line)) if prev else start
+    if same_run and before.get("line") and before.get("since"):
+        # 同じ回の取り直し（照合で合わないとき）は、1 回目と同じ範囲を読む。1 回目で「最後にうまく取れた時刻」が
+        # 進んだあとに線を引き直すと、範囲が直近 14 日に縮み、古い範囲の NG が消える（設計書 5 章・レビュー 4 回目 K-2）
+        first, line, since = bool(before.get("first")), parse_time(before["line"]), parse_time(before["since"])
+    else:
+        first = prev is None
+        line = max(start, prev - datetime.timedelta(days=OVERLAP_DAYS)) if prev else start   # 取り直しの窓の線
+        since = max(start, week_start(line)) if prev else start
     since_q = iso_z(since)
     facts = {"started": iso_z(run.started), "line": iso_z(line), "since": since_q, "first": first, "incomplete": [],
              "notes": []}
-    before = bm.get("fetch") or {}
-    if before.get("started") == facts["started"]:   # 同じ回の取り直し。先に見つけた取りこぼしは消さない
+    if same_run:   # 同じ回の取り直し。先に見つけた取りこぼしは消さない
         facts["incomplete"] = list(before.get("incomplete") or [])
     try:
         return _fetch_repo(run, cfg, log, rdir, bm, rid, base, P, start, first, line, since, since_q, facts)
     finally:
-        # 途中で止まっても、しおり（取ったページの ETag・済んだ PR と CI）は書く。次は 304 で速く追いつける。
-        # 「前回いちばん新しかった記録」と取った期間は、読み切ったときだけ書く（途中で書くと、すき間ができる）
+        # 途中で止まっても、しおり（取ったページの ETag・済んだ PR と CI・前回いちばん新しかった記録と出来事の番号）は書く。
+        # 最後にうまく取れた時刻と取った期間は、読み切ったときだけ進める（読み直す範囲は時刻の線で決まるので、すき間はできない）
         write_json(bm_path(rdir), bm)
+
+
+def refill_if_moved(bm, cfg, base, log):
+    """取り始める日を前にずらした・基準のブランチを変えたリポジトリは、次の取得を最初の取得として読む（設計書 4.9。
+    Slack 版と同じ考え: 取ってある所は取り直さず、足りない古い分を足す）。GitHub の一覧の多くは期間で区切れないので、
+    一覧は新しい日から読み直す。済んだ PR・CI と、取ったページの ETag は使い回す（聞き直さない）。原本は消さない"""
+    read_from, read_base = bm.get("read_from"), bm.get("read_base")
+    if not bm.get("last_success") or (read_from is None and read_base is None):
+        return   # まだ読み切っていない（最初の取得の途中は、そのまま新しい日まで読む）か、比べる元が無い（前の版で読み切った）
+    moved_from = (cfg.get("from") or "") < (read_from or "")
+    moved_base = bool(read_base) and base != read_base
+    if not (moved_from or moved_base):
+        return
+    why = []
+    if moved_from:
+        why.append("取り始める日を %s から %s に前へずらした" % (read_from, cfg.get("from")))
+    if moved_base:
+        why.append("基準のブランチを %s から %s に変えた" % (read_base, base))
+    log.line("  %s。足りない古い分を、最初の取得として読み直します（済んだ PR と CI は聞き直しません）" % "・".join(why))
+    for k in ("last_success", "spans", "fetch", "activity_newest_id", "events_newest_id", "open_lists_done"):
+        bm.pop(k, None)
+    bm["filling"] = {"why": "・".join(why), "at": iso_z(utcnow()), "base_changed": moved_base}
 
 
 def _fetch_repo(run, cfg, log, rdir, bm, rid, base, P, start, first, line, since, since_q, facts):
@@ -629,8 +677,10 @@ def _fetch_repo(run, cfg, log, rdir, bm, rid, base, P, start, first, line, since
     need(run.pages(P + "/commits?" + q({"sha": base, "since": since_q, "per_page": 100}), "commits", rdir, bm),
          "コミット")
 
-    # 5. 手元でたどりきれない入った記録だけ、compare で聞く（作ったとき・つながりの無い書き換えは、後の先頭から全部）
+    # 5. 手元でたどりきれない入った記録だけ、compare で聞く（作ったとき・つながりの無い書き換えは、後の先頭から全部）。
+    #    入った記録の鎖の切れ目（GitHub の側で記録が抜けたもの）も、compare を 1 回聞いて埋める（設計書 4.6）
     resolve_landings(run, cfg, rdir, bm, facts)
+    fill_gaps(run, cfg, rdir, bm)
 
     # 6. PR と issue（一覧で閉じた・マージしたものと出来事を突き合わせるので、出来事より先に取る）
     need(run.pages(P + "/issues?" + q({"state": "all", "since": since_q, "per_page": 100}), "issues", rdir, bm),
@@ -688,7 +738,8 @@ def _fetch_repo(run, cfg, log, rdir, bm, rid, base, P, start, first, line, since
     targets = {}
     if facts.get("base_head"):
         targets[facts["base_head"]] = "base"
-    ci_line = utcnow() - datetime.timedelta(days=ACTIVE_DAYS) if first else line   # 最初の取得は「動いた」＝14 日以内
+    # 最初の取得は、CI の結果が残っている約 13 か月の間に動いた PR まで聞く（それより前は結果がもう無い。設計書 2.1）
+    ci_line = max(start, utcnow() - datetime.timedelta(days=CI_KEEP_DAYS)) if first else line
     for n, pr in moved.items():
         if (parse_time(pr.get("updated_at")) or ci_line) < ci_line:
             continue
@@ -732,6 +783,12 @@ def _fetch_repo(run, cfg, log, rdir, bm, rid, base, P, start, first, line, since
         spans = bm.setdefault("spans", [])
         spans.append([iso_z(since if not first else start), iso_z(run.started)])
         bm["spans"] = merge_spans(spans)
+        # 読み切ったときの取り始める日と基準を覚える（あとで前にずらした・基準を変えたと見分けるため。設計書 4.9）
+        bm["read_from"], bm["read_base"] = cfg.get("from"), base
+        filling = bm.pop("filling", None)
+        if filling:
+            facts["notes"].append("%s。足りない古い分を取りました%s" % (
+                filling.get("why"), "（入ったものは新しいブランチで数え直しました）" if filling.get("base_changed") else ""))
     write_json(bm_path(rdir), bm)
     return facts
 
@@ -742,11 +799,16 @@ def refetch_comments(run, cfg, numbers, limit=20):
     bm = read_json(bm_path(rdir), {}) or {}
     P = "repositories/%d" % int(cfg["id"])
     full = bm.setdefault("full_comments", {})
+    had = {}   # 取り直す前に記録にあった数（取り直しで増えたら「一覧の取りこぼし」と注記に出す）
+    for c in read_jsonl(os.path.join(rdir, "記録", "コメント.jsonl")):
+        if c.get("kind") == "comment":
+            had[c.get("number")] = had.get(c.get("number"), 0) + 1
     try:
         for n in numbers[:limit]:
             out, bad = run.pages(P + "/issues/%d/comments?per_page=100" % n, "comments", rdir, bm)
             if bad is None:
-                full[str(n)] = {"count": sum(len(items) for items, _, _ in out if isinstance(items, list)), "at": iso_z(utcnow())}
+                full[str(n)] = {"count": sum(len(items) for items, _, _ in out if isinstance(items, list)),
+                                "at": iso_z(utcnow()), "before": had.get(n, 0)}
     finally:
         write_json(bm_path(rdir), bm)
 
@@ -796,6 +858,32 @@ def resolve_landings(run, cfg, rdir, bm, facts):
     left = [l for l in model["landings"] if l.get("missing")]
     if left:
         facts["notes"].append("親をたどりきれない入った記録が %d 件あります" % len(left))
+
+
+def chain_breaks(landings):
+    """入った記録の鎖の切れ目（前の記録の後の先頭 ≠ 次の記録の前の先頭）。[(前の後の先頭, 次の記録)]"""
+    out, prev_after = [], None
+    for L in landings:
+        if prev_after and L["before"] not in (prev_after, ZERO_SHA) and L["kind"] not in ("branch_creation", "gap"):
+            out.append((prev_after, L))
+        if L["kind"] != "branch_deletion" and L.get("after") and L["after"] != ZERO_SHA:
+            prev_after = L["after"]
+    return out
+
+
+def fill_gaps(run, cfg, rdir, bm):
+    """入った記録の鎖の切れ目は、GitHub の側で記録が抜けたもの（whisper.cpp の 2023-06-25）。取り直しても直らないので、
+    compare を 1 回聞いて間のコミットを出す（設計書 4.6）。埋めるのは記録を作るとき（landing_model）"""
+    P = "repositories/%d" % int(cfg["id"])
+    asked = bm.setdefault("asked", {})
+    model = landing_model(rdir, cfg)
+    for prev_after, L in chain_breaks(model["landings"]):
+        key = "%s...%s" % (prev_after, L["before"])
+        if asked.get(key):
+            continue
+        out, bad = run.pages(P + "/compare/%s...%s?per_page=100" % (prev_after, L["before"]), "compare", rdir, bm)
+        asked[key] = "404" if (bad is not None and bad.status == 404) else ("done" if bad is None else str(bad.status))
+    write_json(bm_path(rdir), bm)
 
 
 # ==== 記録（原本から作る。何度でも作り直せる。設計書 3.3） ====
@@ -953,7 +1041,7 @@ def landing_model(rdir, cfg, raws=None):
     landed, old = set(), set()
     if acts and acts[0].get("before") not in (None, ZERO_SHA):
         old = reach_all(g, acts[0]["before"])   # 取り始める前からブランチにあったもの
-    landings = []
+    landings, prev_after = [], None
     for a in acts:
         before, after, kind = a.get("before"), a.get("after"), a.get("activity_type")
         actor, actor_id = who(a.get("actor"))
@@ -963,6 +1051,16 @@ def landing_model(rdir, cfg, raws=None):
             L["new"] = []
             landings.append(L)
             continue
+        gap = compares.get((prev_after, before)) if prev_after and before not in (prev_after, ZERO_SHA) \
+            and kind != "branch_creation" else None
+        if gap and gap["status"] == "ahead" and gap["total"] == len(gap["commits"]):
+            # 鎖の切れ目（GitHub の入った記録の抜け）を compare で埋める。入った時刻は次の記録の時刻・推定の印（設計書 4.6）
+            gap_new = [s for s in gap["commits"] if s not in landed]
+            landings.append({"id": "gap:%s" % a["id"], "at": a.get("timestamp"), "kind": "gap", "before": prev_after,
+                             "after": before, "known_at": a.get("_known"), "actor": None, "actor_id": None,
+                             "estimated": True, "new": gap_new})
+            landed |= set(gap_new)
+        prev_after = after
         new, missing = reach_new(g, after, landed | old | {before})
         comp = compares.get((before, after))
         if missing and comp and comp["status"] in ("ahead", "diverged") and comp["total"] == len(comp["commits"]):
@@ -996,7 +1094,7 @@ def classify(model, prs):
                     L["via_guess"] = True
             for s in new:
                 via[s] = n            # None は「分からない」（照合の「入り方の見分け」で NG）
-        elif L["kind"] in ("push", "branch_creation"):
+        elif L["kind"] in ("push", "branch_creation", "gap"):   # gap（記録の抜けを補ったもの）も push の形と同じ決まり
             newset = set(new)
             cands = sorted({by_merge[s] for s in new if s in by_merge} | {by_head[s] for s in new if s in by_head})
             for n in cands:
@@ -1031,7 +1129,7 @@ def build_records(cfg):
                    "via_pr": v if v else None, "title": c.get("title"), "author": c.get("author"),
                    "author_id": c.get("author_id"), "committed_at": c.get("committed_at"),
                    "event": "%s..%s" % ((L["before"] or "")[:7], (L["after"] or "")[:7]),
-                   "merge": len(c.get("p") or []) > 1, "estimated": False, "known_at": L.get("known_at"),
+                   "merge": len(c.get("p") or []) > 1, "estimated": bool(L.get("estimated")), "known_at": L.get("known_at"),
                    "untrusted": ["title"]}
             if L["kind"] in ("pr_merge", "merge_queue_merge") and v is None:
                 row["via_unknown"] = True
@@ -1079,7 +1177,7 @@ def build_records(cfg):
             "commits": p.get("commits"), "additions": p.get("additions"), "deletions": p.get("deletions"),
             "changed_files": p.get("changed_files"), "body": p.get("body") if p.get("body") is not None else it.get("body"),
             "known_at": min(x for x in (pr_known.get(n), issue_known.get(n)) if x) if (pr_known.get(n) or issue_known.get(n)) else None,
-            "untrusted": ["title", "body", "labels", "head_ref", "milestone"]})
+            "untrusted": ["title", "body", "labels", "head_ref", "head_repo", "milestone"]})
     for n, it in sorted(issue_items.items()):
         if it.get("pull_request"):
             continue
@@ -1175,7 +1273,7 @@ def build_records(cfg):
             ci[key] = {"sha": c.get("head_sha") or (m.group(1) if m else None), "kind": "check_run", "name": c.get("name"),
                        "app": (c.get("app") or {}).get("slug"), "status": c.get("status"), "conclusion": c.get("conclusion"),
                        "started_at": c.get("started_at"), "completed_at": c.get("completed_at"),
-                       "known_at": (ci.get(key) or {}).get("known_at") or meta.get("fetched_at"), "untrusted": ["name"]}
+                       "known_at": (ci.get(key) or {}).get("known_at") or meta.get("fetched_at"), "untrusted": ["name", "app"]}
     for meta, body, _ in raws.get("status", []):
         if not isinstance(body, dict):
             continue
@@ -1197,7 +1295,7 @@ def build_records(cfg):
                                              "created_at": r.get("created_at"), "published_at": r.get("published_at"),
                                              "author": a, "author_id": aid,
                                              "known_at": (rel.get(("release", r["id"])) or {}).get("known_at") or meta.get("fetched_at"),
-                                             "untrusted": ["name"]}
+                                             "untrusted": ["name", "tag"]}
     for meta, body, _ in raws.get("tags", []):
         for t in body_items(body):
             if isinstance(t, dict) and t.get("name"):
@@ -1319,6 +1417,8 @@ def repo_stats(cfg, run_start=None, keep_delta=None):
         "id": int(cfg["id"]), "tag": cfg.get("tag") or cfg["name"], "name": facts.get("full_name") or cfg["name"],
         "base": cfg.get("base") or "main", "visibility": facts.get("visibility"), "archived": facts.get("archived"),
         "from": cfg.get("from"), "fetched": local_iso(bm.get("last_success")), "error": None, "error_kind": None,
+        # 一度も最後まで読み切っていないリポジトリを、画面で「取れています」と出さない（設計書 3.4・5 章）
+        "complete": bool(bm.get("last_success")), "pending": pending_reason(bm, rdir),
         "total": len(units), "total_pr": sum(1 for u in units if u["pr"]), "delta": delta,
         "last7": sum(per[d][0] + per[d][1] for d in days[7:]), "last7_pr": sum(per[d][0] for d in days[7:]),
         "prev7": sum(per[d][0] + per[d][1] for d in days[:7]), "week": week,
@@ -1356,12 +1456,32 @@ RECHECK = {"基準の先頭", "開いている数", "出来事と一覧", "件�
 
 
 def short_t(s):
+    """NG と注記の時刻（日本時間）。今年でないときは年を付ける（3 年分の記録で、何年のことか分かるように。設計書 5 章）"""
     t = parse_time(s)
-    return t.astimezone(JST).strftime("%-m/%-d %-H:%M") if t else "?"
+    if not t:
+        return "?"
+    t = t.astimezone(JST)
+    return t.strftime("%-m/%-d %-H:%M") if t.year == jst_today().year else t.strftime("%Y/%-m/%-d %-H:%M")
 
 
-def check_repo(cfg, built=None):
-    """1 つのリポジトリの照合。{項目: [NG の理由]} と、注記を返す"""
+def pending_reason(bm, rdir):
+    """一度も読み切っていないリポジトリの、「確かめていない」の理由（設計書 5 章）。読み切っていれば None"""
+    if bm.get("last_success"):
+        return None
+    if bm.get("filling"):
+        return "古い分を足している途中（%s）" % bm["filling"].get("why")
+    seen = len(bm.get("pr_seen") or {})
+    total = len(read_jsonl(os.path.join(rdir, "記録", "PR.jsonl")))
+    if total:
+        return "最初の取得の途中（PR %s / %s 件まで）" % (format(min(seen, total), ","), format(total, ","))
+    return "最初の取得の途中"
+
+
+def check_repo(cfg, built=None, run_start=None):
+    """1 つのリポジトリの照合。({項目: [NG の理由]}, 注記, 数, 確かめていない理由) を返す。
+    確かめるのは、照合の材料（しおりの fetch）が今回の取得のもの（run_start と同じ）のときだけ。ほかは確かめずに理由を返す
+    （確かめていないのに OK と言わない。前の回の材料で比べると、逆向きの NG も出る。設計書 5 章・レビュー 4 回目 K-1）。
+    run_start が None（状況の数え直し）なら、最後に読み切った回の材料で確かめる"""
     rdir = repo_dir(cfg)
     tag = cfg.get("tag") or cfg["name"]
     rec = os.path.join(rdir, "記録")
@@ -1370,68 +1490,97 @@ def check_repo(cfg, built=None):
     ng = {n: [] for n in CHECK_NAMES}
     notes = []
     if not f:
-        return ng, notes, {}
-    stat = {}
+        return ng, notes, {}, pending_reason(bm, rdir) or "まだ照合の材料が無い"
+    if run_start is not None and f.get("started") != run_start:
+        return ng, notes, {}, "今回は途中で止まった（前回の照合は %s の取得）" % short_t(f.get("started"))
+    stat = {"checked_at": f.get("started")}
+    for n in f.get("notes") or []:   # 取る係の注記（名前が変わっていました・古い分を足しました など）も、照合の注記に出す
+        notes.append("%s: %s" % (tag, n))
     # ページの取りこぼし
     for what in f.get("incomplete") or []:
         ng["ページの取りこぼし"].append("%s: %s が取り直しても取れなかった" % (tag, what))
-    # 件数の突き合わせ（取り始めた日より後に作られたもの）
+    # 件数の突き合わせ（取り始めた日より後に作られたもの）。作者のアカウントが消された PR・issue は検索に出ないので除く
     start = start_of(cfg)
     prs = read_jsonl(os.path.join(rec, "PR.jsonl"))
     issues = read_jsonl(os.path.join(rec, "issue.jsonl"))
-    for kind, rows, label in (("pr", prs, "PR"), ("issue", issues, "issue")):
+    for kind, rows_, label in (("pr", prs, "PR"), ("issue", issues, "issue")):
         s = f.get("search_" + kind) or {}
         if s.get("total") is None:
             continue
-        mine = sum(1 for r in rows if (parse_time(r.get("created_at")) or start) >= start)
+        mine_rows = [r for r in rows_ if (parse_time(r.get("created_at")) or start) >= start]
+        # 作者のアカウントが消された PR は、検索に出ない（issue は出る。10/20 に #3456・#3983 で確かめた）
+        ghosts = [r for r in mine_rows if kind == "pr" and (r.get("author_id") == GHOST_ID or r.get("author") == "ghost")]
+        mine = len(mine_rows) - len(ghosts)
         stat[kind] = (s["total"], mine)
+        if ghosts:
+            notes.append("%s: 作者のアカウントが消された %s %d 件（%s）は、GitHub の検索に出ないので、数から外して比べました"
+                         % (tag, label, len(ghosts), "・".join("#%d" % r["number"] for r in ghosts[:5])))
         if s.get("incomplete"):
             notes.append("%s: GitHub の検索の数が途中までだった（%s）" % (tag, label))
         elif mine != s["total"]:
             ng["件数の突き合わせ"].append("%s: %s が GitHub %s / 取れた %s" % (tag, label, format(s["total"], ","), format(mine, ",")))
+    # コメントの数（合わないものは番号の一覧にして、全部の取り直しに使う。設計書 5 章）
     comments = read_jsonl(os.path.join(rec, "コメント.jsonl"))
     per_num = {}
     for c in comments:
         if c.get("kind") == "comment":
             per_num[c.get("number")] = per_num.get(c.get("number"), 0) + 1
-    checked = bad = 0
+    checked, mismatch = 0, []
     covered = parse_time((bm.get("spans") or [[None]])[0][0]) if bm.get("spans") else None
-    for r in prs + issues:
+    fulls = bm.get("full_comments") or {}
+    for r in sorted(prs + issues, key=lambda r: r["number"]):
         cr = parse_time(r.get("created_at"))
         if r.get("comments") is None or not cr or not covered or cr < covered:
             continue
         checked += 1
         mine = per_num.get(r["number"], 0)
-        if mine != r["comments"]:
-            full = (bm.get("full_comments") or {}).get(str(r["number"])) or {}
-            if full.get("count") == mine:
-                # 全部取り直しても、見えるコメントは記録と同じ。GitHub の数には、消された・隠されたコメントが入っている
-                notes.append("%s: #%d のコメントは GitHub の数 %d・見えるコメント %d（GitHub の側で見えないコメントの差。全部取り直して確かめた）"
-                             % (tag, r["number"], r["comments"], mine))
-                continue
-            bad += 1
-            if bad <= 3:
-                ng["件数の突き合わせ"].append("%s: #%d のコメントが GitHub %d / 取れた %d" % (tag, r["number"], r["comments"], mine))
+        full = fulls.get(str(r["number"])) or {}
+        fresh = (full.get("at") or "") >= (r.get("updated_at") or "")   # 取り直したあと、その issue・PR は動いていない
+        if fresh and full.get("before") is not None and full.get("count", 0) > full["before"]:
+            notes.append("%s: #%d のコメントを全部取り直したら %d 件増えました（一覧の取りこぼし）"
+                         % (tag, r["number"], full["count"] - full["before"]))
+        if mine == r["comments"]:
+            continue
+        # 全部取り直した結果は、取り直したあと動いていないときだけ使う（古い結果で、新しいコメントの取りこぼしを隠さない）
+        if fresh and full.get("count") == mine:
+            if mine > r["comments"]:
+                notes.append("%s: #%d は GitHub の数より %d 多く見えます（GitHub の側の数え違い。全部取り直して確かめた）"
+                             % (tag, r["number"], mine - r["comments"]))
+            else:
+                notes.append("%s: #%d は GitHub の数のうち %d 件が見えません（消された・隠されたコメント。全部取り直して確かめた）"
+                             % (tag, r["number"], r["comments"] - mine))
+            continue
+        mismatch.append(r["number"])
+    if mismatch:
+        ng["件数の突き合わせ"].append("%s: コメントの数が合わない issue・PR が %d 件（%s%s）" % (
+            tag, len(mismatch), "・".join("#%d" % n for n in mismatch[:3]),
+            "ほか %d 件" % (len(mismatch) - 3) if len(mismatch) > 3 else ""))
     stat["comments_checked"] = checked
+    stat["comment_mismatch"] = mismatch
     # 期間の抜け
     spans = bm.get("spans") or []
     if len(spans) > 1:
         ng["期間の抜け"].append("%s: %s〜%s が取れていない" % (tag, short_t(spans[0][1]), short_t(spans[1][0])))
     elif spans and parse_time(spans[0][0]) and parse_time(spans[0][0]) > start + datetime.timedelta(minutes=1):
         ng["期間の抜け"].append("%s: 取り始めた日（%s）から取れていない" % (tag, cfg.get("from")))
-    # ブランチのつながり・入り方の見分け・基準の先頭（入った記録から）
+    # ブランチのつながり（記録の抜けを compare で補ったものは注記）・入り方の見分け・基準の先頭（入った記録から）
     model = (built or {}).get("model") or classify(landing_model(rdir, cfg), pr_latest(load_raw(rdir, {"pulls", "pull", "pulls_open"}))[0])
-    lands = [L for L in model["landings"]]
+    lands = model["landings"]
+    g = model["graph"]
     prev_after = None
     for L in lands:
         if L["kind"] == "force_push":
             notes.append("%s: %s が %s に書き換えられました（強制の書き換え）。前の歴史は原本に残っています" % (tag, cfg.get("base"), short_t(L["at"])))
-        if prev_after and L["before"] not in (prev_after, ZERO_SHA) and L["kind"] != "branch_creation":
-            ng["ブランチのつながり"].append("%s: 入った記録の鎖が %s で切れている" % (tag, short_t(L["at"])))
+        if L["kind"] == "gap":
+            ts = [x for x in ((g.get(s) or {}).get("committed_at") for s in L.get("new") or []) if x]
+            notes.append("%s: GitHub の入った記録が %s ごろ 1 つ抜けていました。間のコミット %d 個を compare で補いました（推定）"
+                         % (tag, short_t(max(ts) if ts else L["at"]), len(L.get("new") or [])))
         if L.get("missing"):
             ng["ブランチのつながり"].append("%s: %s の入った記録の親をたどりきれない" % (tag, short_t(L["at"])))
         if L["kind"] != "branch_deletion" and L.get("after") and L["after"] != ZERO_SHA:
             prev_after = L["after"]
+    for _, L in chain_breaks(lands):
+        ng["ブランチのつながり"].append("%s: 入った記録の鎖が %s で切れている（compare で埋められなかった）" % (tag, short_t(L["at"])))
     rows = read_jsonl(os.path.join(rec, "入ったもの.jsonl"))
     unknown = [r for r in rows if r.get("via_unknown")]
     if unknown:
@@ -1440,6 +1589,16 @@ def check_repo(cfg, built=None):
     if guessed:
         notes.append("%s: PR の番号を題名の (#…) から補ったものが %d 件" % (tag, len(guessed)))
     stat["landed"] = len(rows)
+    # 入った記録が始まる前の分は、まだ数えていない（推定は 12 章のとおり段 10）。NG にせず注記に出す（K-9）
+    acts = [L for L in lands if L["kind"] != "gap"]
+    first_at = parse_time(acts[0]["at"]) if acts else None
+    if first_at and first_at - start > datetime.timedelta(days=1):
+        landed_shas = {r.get("sha") for r in rows}
+        n_old = sum(1 for sha, c in g.items() if sha not in landed_shas
+                    and start <= (parse_time(c.get("committed_at")) or first_at) < first_at)
+        if n_old:
+            notes.append("%s: 取り始めた日（%s）から、GitHub の入った記録が始まる日（%s）までの %s コミットは、入ったものに数えていません"
+                         % (tag, cfg.get("from"), jst_day(acts[0]["at"]), format(n_old, ",")))
     if f.get("base_head") and prev_after and f["base_head"] != prev_after:
         ng["基準の先頭"].append("%s: %s が動いたのに、入った記録が追いついていない（GitHub の先頭 %s・記録の最後 %s）"
                               % (tag, cfg.get("base"), f["base_head"][:7], prev_after[:7]))
@@ -1453,7 +1612,8 @@ def check_repo(cfg, built=None):
     ev = f.get("events") or {}
     if ev and not ev.get("found_prev") and not ev.get("first_page_same"):
         ng["出来事のつながり"].append("%s: 前回いちばん新しかった出来事が見つからない（消された issue の出来事かもしれません）" % tag)
-    # 出来事と一覧（閉じた・マージしたものに、5 秒以内の closed・merged がある。読んだ範囲の端から 5 秒は見ない）
+    # 出来事と一覧（閉じた・マージしたものに、5 秒以内の出来事がある。読んだ範囲の端から 5 秒は見ない）。
+    # discussion に移した issue は、GitHub が閉じるが、出来事は converted_to_discussion で残る（K-3）
     lo = parse_time(ev.get("oldest_read"))
     hi = parse_time(f.get("ended"))
     if lo and hi:
@@ -1463,38 +1623,49 @@ def check_repo(cfg, built=None):
             events.setdefault((e.get("number"), e.get("event")), []).append(parse_time(e.get("at")))
         miss, n_checked = [], 0
         for r in prs + issues:
-            for field, kind in (("closed_at", "closed"), ("merged_at", "merged")):
+            for field, kinds in (("closed_at", ("closed", "converted_to_discussion")), ("merged_at", ("merged",))):
                 t = parse_time(r.get(field))
                 if not t or t < lo or t > hi:
                     continue
                 n_checked += 1
-                if not any(x and abs((x - t).total_seconds()) <= 5 for x in events.get((r["number"], kind), [])):
-                    miss.append("#%d（%s）" % (r["number"], kind))
+                if not any(x and abs((x - t).total_seconds()) <= 5 for k in kinds for x in events.get((r["number"], k), [])):
+                    miss.append("#%d（%s）" % (r["number"], kinds[0]))
         stat["events_checked"] = n_checked
         if miss:
-            ng["出来事と一覧"].append("%s: 一覧では閉じた・マージしたのに、出来事が無い: %s" % (tag, "・".join(miss[:5])))
+            ng["出来事と一覧"].append("%s: 一覧では閉じた・マージしたのに、出来事が無い: %s%s" % (
+                tag, "・".join(miss[:5]), " ほか %d 件" % (len(miss) - 5) if len(miss) > 5 else ""))
     # 原本の形
     broken = (built or {}).get("broken")
     if broken is None:
         broken = broken_raws(rdir)
     if broken:
         ng["原本の形"].append("%s: 読めない原本が %d 個" % (tag, len(broken)))
-    return ng, notes, stat
+    return ng, notes, stat, None
 
 
-def run_checks(repos, built_map=None, skip=()):
-    """全部のリポジトリの照合。状態.json の check（items・ng・notes・exceptions）を作る"""
+def run_checks(repos, built_map=None, skip=None, run_start=None):
+    """全部のリポジトリの照合。状態.json の check を作る。確かめていないリポジトリ（最初の取得の途中・古い分を足している途中・
+    今回は途中で止まった・取れなかった）は、OK にも NG にもせず、理由を出す（設計書 5 章）。
+    項目の ok は真か偽だけ（アプリは null を読めない）。確かめていない項目は ok が偽で、state が unverified。
+    返すのは (check, 項目ごとの NG の行, リポジトリごとの数)"""
     exceptions = read_json(EXCEPTIONS_PATH, []) or []
+    skip = skip or {}
     total = {n: [] for n in CHECK_NAMES}
-    notes, stats = [], {}
+    notes, stats, unverified, checked_at = [], {}, [], []
     for cfg in repos:
+        tag = cfg.get("tag") or cfg["name"]
         if cfg["id"] in skip:
+            unverified.append({"repo": tag, "reason": "取れなかった（%s）" % (skip[cfg["id"]] or "理由は取得ログ")})
             continue
-        ng, nt, st = check_repo(cfg, (built_map or {}).get(cfg["id"]))
+        ng, nt, st, why = check_repo(cfg, (built_map or {}).get(cfg["id"]), run_start)
+        if why:
+            unverified.append({"repo": tag, "reason": why})
+            continue
         for k, v in ng.items():
             total[k].extend(v)
         notes.extend(nt)
         stats[cfg["id"]] = st
+        checked_at.append(st.get("checked_at"))
     known = []
     for k in CHECK_NAMES:
         keep = []
@@ -1505,7 +1676,7 @@ def run_checks(repos, built_map=None, skip=()):
             else:
                 keep.append(line)
         total[k] = keep
-    n_repos = len([c for c in repos if c["id"] not in skip])
+    n_repos = len(stats)
     landed = sum(s.get("landed", 0) for s in stats.values())
     ok_detail = {
         "ページの取りこぼし": "一覧を最後のページまで取れた（%d リポジトリ）・取り直しても取れなかった一覧 0" % n_repos,
@@ -1518,19 +1689,30 @@ def run_checks(repos, built_map=None, skip=()):
         "入り方の見分け": "入ったコミット %s 件すべて、PR 経由か直接か（強制の書き換えは数えない）に分かれた" % format(landed, ","),
         "基準の先頭": "GitHub がいま指している基準の先頭と、記録の最後が同じ（%d リポジトリ）" % n_repos,
         "開いている数": "開いている PR と issue の数が GitHub の数と一致（%s 件）" % format(sum((s.get("open") or (0, 0))[0] for s in stats.values()), ","),
-        "出来事のつながり": "前回いちばん新しかった出来事が、今回も見つかった",
-        "出来事と一覧": "一覧で閉じた・マージしたもの %d 件に、同じ時刻の出来事がある" % sum(s.get("events_checked", 0) for s in stats.values()),
-        "原本の形": "読めない原本 0",
+        "出来事のつながり": "前回いちばん新しかった出来事が、今回も見つかった（%d リポジトリ）" % n_repos,
+        "出来事と一覧": "一覧で閉じた・マージしたもの %s 件に、同じ時刻の出来事がある" % format(sum(s.get("events_checked", 0) for s in stats.values()), ","),
+        "原本の形": "読めない原本 0（%d リポジトリ）" % n_repos,
         "既知の例外": "%d 件（GitHub 側の食い違いで直しようがないもの）" % len(known),
     }
+    pend = "・".join("%s（%s）" % (u["repo"], u["reason"]) for u in unverified[:3]) + (
+        " ほか %d" % (len(unverified) - 3) if len(unverified) > 3 else "")
     items = []
     for k in CHECK_NAMES:
         if total[k]:
-            items.append({"name": k, "ok": False, "detail": "・".join(total[k][:3]) + ("ほか %d" % (len(total[k]) - 3) if len(total[k]) > 3 else "")})
+            items.append({"name": k, "ok": False, "state": "ng",
+                          "detail": "・".join(total[k][:3]) + ("ほか %d" % (len(total[k]) - 3) if len(total[k]) > 3 else "")})
+        elif unverified:
+            detail = "確かめていない: %s" % pend
+            if n_repos:
+                detail += "。確かめた %d リポジトリは OK（%s）" % (n_repos, ok_detail[k])
+            items.append({"name": k, "ok": False, "state": "unverified", "detail": detail})
         else:
-            items.append({"name": k, "ok": True, "detail": ok_detail[k]})
-    ng_lines = ["NG: %s" % line for k in CHECK_NAMES for line in total[k]]
-    return {"ng": ng_lines, "notes": notes, "items": items, "exceptions": known}, total
+            items.append({"name": k, "ok": True, "state": "ok", "detail": ok_detail[k]})
+    ng_lines = ["NG %s" % line for k in CHECK_NAMES for line in total[k]]   # 頭は Slack 版と同じ「NG 」
+    stamps = [c for c in checked_at if c]
+    check = {"ng": ng_lines, "notes": notes, "items": items, "exceptions": known, "unverified": unverified,
+             "checked_at": local_iso(max(stamps)) if stamps else None}
+    return check, total, stats
 
 
 # ==== 状態.json と取得の記録 ====
@@ -1559,7 +1741,7 @@ def public_stats(stats, errors=None):
 
 def write_running(run, progress, prev_end):
     st = read_json(STATE_PATH, {}) or {}
-    st.update(source="github", updated=now_iso())
+    st.update(source="github", updated=now_iso(), state="running")   # 取得中（Slack 版と同じ。設計書 3.4）
     st["run"] = {"start": local_iso(iso_z(run.started)), "end": None, "result": None, "note": None,
                  "since": prev_end, "calls": run.calls, "calls_free": run.free, "calls_cap": run.cap,
                  "rate": local_rate(run.rate), "progress": progress}
@@ -1694,6 +1876,17 @@ def cmd_fetch(_args):
     if data_inside_code():
         print("データの場所（%s）が、取得の仕組みのフォルダの中にあります。外に置いてください（GITHUB_FETCH_DATA）。" % DATA)
         return 2
+    no_id = [r.get("name") or "?" for r in (read_json(REPOS_PATH, []) or []) if isinstance(r, dict) and not r.get("id")]
+    if no_id:
+        # 番号が 0 か無い（例を写したまま）。番号で取るので、知らないリポジトリを取りに行かないように止める（設計書 3.6）
+        msg = ("番号が入っていないリポジトリがあります（%s）。python3 github.py setup --find owner/name で調べて、"
+               "リポジトリ.json の id に書いてください" % "・".join(no_id))
+        print(msg)
+        st = read_json(STATE_PATH, {}) or {}
+        st.update(source="github", updated=now_iso(), state="error",
+                  run=dict(st.get("run") or {}, end=now_iso(), result="error", note=msg, progress=None))
+        write_json(STATE_PATH, st)
+        return 2
     repos = listed_repos()
     if not repos:
         print("取るリポジトリがありません（リポジトリ.json）。アプリの「はじめの準備」で選んでください。")
@@ -1765,13 +1958,16 @@ def fetch_all(repos, run, log, cap):
         except Exception as e:   # 1 つが崩れても、ほかの記録は作る。全文は取得ログに
             log.line("記録を作れなかった（%s）: %r" % (cfg.get("tag"), e))
     # 合わないものは、少し待って 1 回だけ取り直す（基準の先頭・開いている数・出来事と一覧）
-    check, by_item = run_checks(repos, built, skip=set(errors))
+    skip = {k: v[0] for k, v in errors.items()}
+    run_start = iso_z(run.started)
+    check, by_item, cstats = run_checks(repos, built, skip=skip, run_start=run_start)
     if stop is None and any(by_item[k] for k in RECHECK):
         def mine(cfg, k, pred=lambda line: True):
             t = (cfg.get("tag") or cfg["name"]) + ":"
             return [line for line in by_item[k] if line.startswith(t) and pred(line)]
-        is_comment = lambda line: "のコメントが" in line
-        fixc = {int(c["id"]): [int(m) for m in re.findall(r"#([0-9]+) のコメントが", "\n".join(mine(c, "件数の突き合わせ", is_comment)))]
+        is_comment = lambda line: "コメントの数が合わない" in line
+        # 全部取り直すのは、合わなかった番号の一覧から（NG の行から拾わない。1 回で 20 件まで。設計書 5 章）
+        fixc = {int(c["id"]): (cstats.get(c["id"]) or {}).get("comment_mismatch") or []
                 for c in repos if int(c["id"]) not in errors}
         again = [c for c in repos if int(c["id"]) not in errors and (
             any(mine(c, k) for k in RECHECK - {"件数の突き合わせ"}) or mine(c, "件数の突き合わせ", lambda l: not is_comment(l)))]
@@ -1789,7 +1985,7 @@ def fetch_all(repos, run, log, cap):
                     built[int(c["id"])] = build_records(c)
         except (Stop, RepoError) as e:
             log.line("取り直しの途中で止まった: %s" % getattr(e, "message", e))
-        check, by_item = run_checks(repos, built, skip=set(errors))
+        check, by_item, cstats = run_checks(repos, built, skip=skip, run_start=run_start)
     stats = all_stats(repos, run_start=iso_z(run.started))
     if stop is not None:
         result, note = stop_result(stop)
@@ -1808,10 +2004,16 @@ def fetch_all(repos, run, log, cap):
                 "calls": run.calls, "calls_free": run.free, "calls_cap": cap, "rate": local_rate(run.rate),
                 "wait_until": local_iso(stop.wait_until) if stop is not None and stop.wait_until else None,
                 "progress": None, "repos_failed": [(c.get("tag") or c["name"]) for c in repos if int(c["id"]) in errors]}
+    if stop is not None and stop.kind == "cap" and any(
+            pending_reason(read_json(bm_path(repo_dir(c)), {}) or {}, repo_dir(c)) for c in repos):
+        # 最初の取得（または古い分を足している途中）で上限に届いた。大きいリポジトリではふつうの流れなので、
+        # アプリは赤の「途中で止まりました」ではなく、黄の「最初の取得の途中です」を出す（設計書 6・7 章）
+        run_info["first_partial"] = True
     spans = mac_sleeps(run.started.timestamp(), time.time())
     if spans:
         run_info["sleep"] = sleep_info(spans)
-    if spans and (result in ("ng", "error", "partial") or (result == "stopped" and stop is not None and stop.kind != "stop")):
+    # 知らせるのは、止まった理由がスリープのときだけ（上限や止めるボタンで止まった回に、少し眠っていただけなら知らせない）
+    if spans and result in ("ng", "error", "partial"):
         run_info["sleep_missed"] = True
     if os.environ.get("SLEEP_DELAYED"):
         run_info["delayed_from"] = os.environ["SLEEP_DELAYED"]
@@ -1820,6 +2022,9 @@ def fetch_all(repos, run, log, cap):
               daily=daily_of(stats), check=check, auth=auth)
     if result == "ok":
         st["last_success"] = end
+    if result in ("ok", "ng", "partial"):
+        # 最後まで読み切った回の時刻。アプリの「古い」（26 時間）はこれで見る（設計書 3.4・6 章）
+        st["last_read"] = end
     write_json(STATE_PATH, st)
     hist = {k: run_info.get(k) for k in ("start", "end", "result", "note", "new", "calls", "calls_free")}
     hist.update(ng=len(check["ng"]), failed=run_info["repos_failed"],
@@ -1844,6 +2049,8 @@ def fetch_all(repos, run, log, cap):
         notify("ログインが必要です", "ターミナルで gh にログインしてから、もう一度取ってください")
     elif result == "partial":
         notify("一部のリポジトリが取れませんでした", note or "")
+    elif result == "stopped" and run_info.get("first_partial"):
+        notify("最初の取得の途中です", "1,500 回ずつ分けて取ります。続きは次の取得で取ります")
     elif result == "stopped":
         notify("途中で止まりました", note or "")
     else:
@@ -1868,12 +2075,12 @@ def cmd_status(args):
     st = read_json(STATE_PATH, {}) or {}
     stats = all_stats(repos)
     errors = {r["id"]: (r.get("error"), r.get("error_kind")) for r in st.get("repos") or [] if r.get("error")}
-    check, _ = run_checks(repos, skip=set(errors))
+    check, _, _ = run_checks(repos, skip={k: v[0] for k, v in errors.items()})
     if st.get("state") in ("ok", "ng"):
         st["state"] = "ng" if check["ng"] else "ok"   # 取得のあとの印は、数え直した照合に合わせる（止まった・失敗はそのまま）
     st.update(source="github", updated=now_iso(), repos=public_stats(stats, errors), daily=daily_of(stats), check=check)
     write_json(STATE_PATH, st)
-    print("数え直しました（照合 NG %d）" % len(check["ng"]))
+    print("数え直しました（照合 NG %d・確かめていない %d）" % (len(check["ng"]), len(check["unverified"])))
     return 0
 
 
@@ -1883,7 +2090,7 @@ def candidate_of(r):
     return {"id": r["id"], "name": r.get("full_name"), "private": r.get("private"), "archived": r.get("archived"),
             "fork": r.get("fork"), "default_branch": r.get("default_branch"), "created": jst_day(r.get("created_at")),
             "pushed": r.get("pushed_at"), "description": one_line(r.get("description"), 200),
-            "issues": r.get("open_issues_count")}
+            "open_items": r.get("open_issues_count")}   # 開いている PR と issue の合計（issue の数は --inspect で検索から）
 
 
 def cmd_setup(args):
@@ -1924,7 +2131,7 @@ def cmd_setup(args):
                     break
                 for x in r.data:
                     c = candidate_of(x)
-                    c.update({k: v for k, v in (repos.get(x["id"]) or {}).items() if k in ("branches", "hint", "estimate", "prs", "commits")})
+                    c.update({k: v for k, v in (repos.get(x["id"]) or {}).items() if k in ("branches", "hint", "estimate", "prs", "issues", "commits")})
                     repos[x["id"]] = c
                     found += 1
                 where = r.next
@@ -1932,13 +2139,13 @@ def cmd_setup(args):
         elif mode == "--find" and len(args) > 1:
             q = args[1].strip()
             last["query"] = q
-            if not re.fullmatch(_NAME + "/" + _NAME, q):
+            if not re.fullmatch(_NAME + "/" + _NAME, q) or any(x in (".", "..") for x in q.split("/")):
                 last["error"] = "owner/name の形で入れてください（例: ggml-org/whisper.cpp）"
             else:
                 r = run.get("repos/" + q, "repo", save=False, quiet_404=True)
                 if r.status == 200:
                     c = candidate_of(r.data)
-                    c.update({k: v for k, v in (repos.get(r.data["id"]) or {}).items() if k in ("branches", "hint", "estimate", "prs", "commits")})
+                    c.update({k: v for k, v in (repos.get(r.data["id"]) or {}).items() if k in ("branches", "hint", "estimate", "prs", "issues", "commits")})
                     repos[r.data["id"]] = c
                     last.update(ok=True, found=1)
                 else:
@@ -1997,25 +2204,34 @@ def inspect_repo(run, c):
         if quiet and others:
             hint = {"suggested": others[0][1], "pushes30": others[0][0],
                     "default_quiet_since": jst_day(iso_z(last_by[d])) if d in last_by else None}
-    c["hint"] = hint or None
+    c["hint"] = hint or {}   # 提案が無いときも空で書く（null だと、アプリが「まだ調べていない」と読んで調べ直す）
     counts = {}
-    for kind in ("pr", "issue"):
-        r = run.get("search/issues?" + urllib.parse.urlencode({"q": "repo:%s is:%s" % (c["name"], kind), "per_page": 1}),
+    now = utcnow()
+    d90 = iso_z(now - datetime.timedelta(days=90))
+    d400 = iso_z(now - datetime.timedelta(days=CI_KEEP_DAYS))
+    for key, q in (("pr", "is:pr"), ("issue", "is:issue"), ("pr90", "is:pr updated:>=" + d90),
+                   ("issue90", "is:issue updated:>=" + d90), ("pr400", "is:pr updated:>=" + d400)):
+        r = run.get("search/issues?" + urllib.parse.urlencode({"q": "repo:%s %s" % (c["name"], q), "per_page": 1}),
                     "search", save=False)
-        counts[kind] = r.data.get("total_count", 0) if r.status == 200 else 0
+        counts[key] = r.data.get("total_count", 0) if r.status == 200 else 0
     r = run.get(P + "/commits?per_page=1", "commits", save=False)
     commits = 0
     if r.status == 200:
         m = re.search(r'[?&]page=([0-9]+)>; rel="last"', r.headers.get("link", ""))
         commits = int(m.group(1)) if m else len(r.data)
-    c.update(prs=counts["pr"], commits=commits)
-    items = counts["pr"] + counts["issue"]
+    c.update(prs=counts["pr"], issues=counts["issue"], commits=commits)
     # 見込み（設計書 4.7 の考え方）: 一覧は 100 件で 1 回・PR 1 件で詳しさとレビューの 2 回・出来事は件数の約 1/20 ページ・
-    # コメントは PR と issue の約 3 倍。90 日は、作った日からの日数で割り合いを出す（大まかな見込み）
-    full = (commits // 100 + 1) + (items // 100 + 1) * 2 + counts["pr"] * 2 + items // 20 + (items * 3) // 100 + 20
+    # コメントは PR と issue の約 3 倍・CI は約 13 か月に動いた PR に 2 回（最初の取得）。
+    # 「90 日前から」は、検索で数えた最近 90 日に動いた PR と issue から出す（日数の割り合いだと半分ほどに出た。10/20）
     created = parse_time((c.get("created") or "1970-01-01") + "T00:00:00+09:00")
-    days = max(1, (utcnow() - created).days) if created else 90
-    c["estimate"] = {"all": full, "days90": max(20, int(full * min(1.0, 90.0 / days)))}
+    days = max(1, (now - created).days) if created else 90
+
+    def guess(n_commits, prs, issues, ci_prs):
+        items = prs + issues
+        return (n_commits // 100 + 1) + (items // 100 + 1) * 2 + prs * 2 + max(1, items // 20) + max(1, (items * 3) // 100) \
+            + 20 + ci_prs * 2
+    c["estimate"] = {"all": guess(commits, counts["pr"], counts["issue"], counts["pr400"]),
+                     "days90": guess(int(commits * min(1.0, 90.0 / days)), counts["pr90"], counts["issue90"], counts["pr90"])}
 
 
 def main(argv):
