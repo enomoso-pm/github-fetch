@@ -52,7 +52,7 @@ RATE_RESERVE = 300          # GitHub の枠に残しておく回数（設計書 
 OVERLAP_DAYS = 14           # 取り直しの窓（設計書 4.5）
 ACTIVE_DAYS = 14            # 「動いた」とみなす日数
 CI_KEEP_DAYS = 400          # CI の結果が GitHub に残っている目安（約 13 か月）。最初の取得はこの間に動いた PR の CI を聞く（設計書 2.1）
-GHOST_ID = 10137            # 消されたアカウント（ghost）の番号。作者がこれの PR は、検索に出ない（設計書 5 章）
+GHOST_ID = 10137            # 消されたアカウント（ghost）の番号。作者がこれの PR・issue は、検索に出ないことがある（設計書 5 章）
 WAIT_SCALE = float(os.environ.get("GITHUB_FETCH_WAIT_SCALE") or 1)   # 試しのときだけ 0（待たない）
 RETRY_WAITS = (2, 5, 10)    # 取り直しの間（3 回まで）
 RECHECK_WAIT = 20           # 照合で合わないとき、取り直す前に待つ秒数
@@ -588,6 +588,8 @@ def fetch_repo(run, cfg, log):
     start = start_of(cfg)
     before = bm.get("fetch") or {}
     same_run = before.get("started") == iso_z(run.started)
+    # 取りかかった回（途中で止まっても、下の finally で残る）。状況の数え直しは、照合の材料の回と違えば確かめない（設計書 5 章・S-1 の V6）
+    bm["attempt"] = iso_z(run.started)
     if not same_run:
         refill_if_moved(bm, cfg, base, log)
     prev = parse_time(bm.get("last_success"))
@@ -1470,6 +1472,10 @@ def pending_reason(bm, rdir):
         return None
     if bm.get("filling"):
         return "古い分を足している途中・%s" % bm["filling"].get("why")
+    if not bm:
+        return "まだ一度も取っていない"   # 足したばかり（しおりは、取りかかったときに書く。10/21・S-1 の V8）
+    if (bm.get("fetch") or {}).get("incomplete"):
+        return "取りこぼしがあり、次の取得で読み直す"   # 前は、いつまでも「最初の取得の途中」と出た（10/21・X-4）
     seen = len(bm.get("pr_seen") or {})
     total = len(read_jsonl(os.path.join(rdir, "記録", "PR.jsonl")))
     if total:
@@ -1477,11 +1483,24 @@ def pending_reason(bm, rdir):
     return "最初の取得の途中"
 
 
+def moved_since_read(bm, cfg):
+    """最後に読み切ったときから、取り始める日（前にも後ろにも）・基準のブランチを変えたか。変えていれば理由の文、なければ None。
+    比べる元（read_from・read_base）が無いしおり（前の版で読み切った）は比べない（設計書 11 章の S-2）"""
+    why = []
+    read_from, read_base = bm.get("read_from"), bm.get("read_base")
+    if read_from and cfg.get("from") and cfg["from"] != read_from:
+        why.append("取り始める日を %s から %s に変えた" % (read_from, cfg.get("from")))
+    if read_base and (cfg.get("base") or "main") != read_base:
+        why.append("基準のブランチを %s から %s に変えた" % (read_base, cfg.get("base") or "main"))
+    return "・".join(why) or None
+
+
 def check_repo(cfg, built=None, run_start=None):
     """1 つのリポジトリの照合。({項目: [NG の理由]}, 注記, 数, 確かめていない理由) を返す。
     確かめるのは、照合の材料（しおりの fetch）が今回の取得のもの（run_start と同じ）のときだけ。ほかは確かめずに理由を返す
     （確かめていないのに OK と言わない。前の回の材料で比べると、逆向きの NG も出る。設計書 5 章・レビュー 4 回目 K-1）。
-    run_start が None（状況の数え直し）なら、最後に読み切った回の材料で確かめる"""
+    run_start が None（状況の数え直し）でも同じ決まりを使う: 最後に取りかかった回で読み切っていない・取り始める日や
+    基準のブランチを変えたリポジトリは確かめない（設計書 5 章・4.9・レビュー 5 回目 S-1）"""
     rdir = repo_dir(cfg)
     tag = cfg.get("tag") or cfg["name"]
     rec = os.path.join(rdir, "記録")
@@ -1493,13 +1512,22 @@ def check_repo(cfg, built=None, run_start=None):
         return ng, notes, {}, pending_reason(bm, rdir) or "まだ照合の材料が無い"
     if run_start is not None and f.get("started") != run_start:
         return ng, notes, {}, "今回は途中で止まった・前回の照合は %s の取得" % short_t(f.get("started"))
+    if run_start is None:
+        if bm.get("attempt") and bm["attempt"] != f.get("started"):
+            # 取りかかった回が途中で止まった。止まった回が進めた記録と、その前の回の材料を比べると、逆向きの NG が出る（V6）
+            return ng, notes, {}, "前の取得が途中で止まった・次の取得で確かめる"
+        moved = moved_since_read(bm, cfg)
+        if moved:
+            return ng, notes, {}, "%s・次の取得で確かめる" % moved   # 保存した直後に NG にしない（V7。設計書 4.9）
     stat = {"checked_at": f.get("started")}
     for n in f.get("notes") or []:   # 取る係の注記（名前が変わっていました・古い分を足しました など）も、照合の注記に出す
         notes.append("%s: %s" % (tag, n))
     # ページの取りこぼし
     for what in f.get("incomplete") or []:
         ng["ページの取りこぼし"].append("%s: %s が取り直しても取れなかった" % (tag, what))
-    # 件数の突き合わせ（取り始めた日より後に作られたもの）。作者のアカウントが消された PR・issue は検索に出ないので除く
+    # 件数の突き合わせ（取り始めた日より後に作られたもの）。作者のアカウントが消された PR・issue は、検索に出るものと
+    # 出ないものがある（whisper.cpp では PR 3 件が出ず、issue #3983 は出た）。決め打ちせず、記録にあって検索に出ない数が
+    # 0 から消されたものの数までなら NG にしない（設計書 5 章・10/21 本人の指示。前は PR だけ必ず除き、検索に出るリポジトリで NG になった）
     start = start_of(cfg)
     prs = read_jsonl(os.path.join(rec, "PR.jsonl"))
     issues = read_jsonl(os.path.join(rec, "issue.jsonl"))
@@ -1508,17 +1536,21 @@ def check_repo(cfg, built=None, run_start=None):
         if s.get("total") is None:
             continue
         mine_rows = [r for r in rows_ if (parse_time(r.get("created_at")) or start) >= start]
-        # 作者のアカウントが消された PR は、検索に出ない（issue は出る。10/20 に #3456・#3983 で確かめた）
-        ghosts = [r for r in mine_rows if kind == "pr" and (r.get("author_id") == GHOST_ID or r.get("author") == "ghost")]
-        mine = len(mine_rows) - len(ghosts)
-        stat[kind] = (s["total"], mine)
-        if ghosts:
-            notes.append("%s: 作者のアカウントが消された %s %d 件（%s）は、GitHub の検索に出ないので、数から外して比べました"
-                         % (tag, label, len(ghosts), "・".join("#%d" % r["number"] for r in ghosts[:5])))
+        ghosts = [r for r in mine_rows if r.get("author_id") == GHOST_ID or r.get("author") == "ghost"]
+        total = s["total"]
+        hidden = len(mine_rows) - total   # 記録にあって、GitHub の検索に出ない数
+        stat[kind] = (total, len(mine_rows) - max(0, min(hidden, len(ghosts))))
         if s.get("incomplete"):
             notes.append("%s: GitHub の検索の数が途中までだった（%s）" % (tag, label))
-        elif mine != s["total"]:
-            ng["件数の突き合わせ"].append("%s: %s が GitHub %s / 取れた %s" % (tag, label, format(s["total"], ","), format(mine, ",")))
+        elif 0 <= hidden <= len(ghosts):
+            if hidden:
+                notes.append("%s: 作者のアカウントが消された %s %d 件（%s）%sは、GitHub の検索に出ないので、数から外して比べました"
+                             % (tag, label, len(ghosts), "・".join("#%d" % r["number"] for r in ghosts[:5]),
+                                "" if hidden == len(ghosts) else "のうち %d 件" % hidden))
+        else:
+            ng["件数の突き合わせ"].append("%s: %s が GitHub %s / 取れた %s%s" % (
+                tag, label, format(total, ","), format(len(mine_rows), ","),
+                "（うち作者のアカウントが消されたもの %d 件）" % len(ghosts) if ghosts else ""))
     # コメントの数（合わないものは番号の一覧にして、全部の取り直しに使う。設計書 5 章）
     comments = read_jsonl(os.path.join(rec, "コメント.jsonl"))
     per_num = {}
@@ -2029,7 +2061,7 @@ def fetch_all(repos, run, log, cap):
     hist = {k: run_info.get(k) for k in ("start", "end", "result", "note", "new", "calls", "calls_free")}
     hist.update(ng=len(check["ng"]), failed=run_info["repos_failed"],
                 repos={s["tag"]: s.get("delta") or 0 for s in stats})
-    for k in ("sleep", "delayed_from", "sleep_missed"):
+    for k in ("sleep", "delayed_from", "sleep_missed", "first_partial"):   # first_partial: アプリは「最初の取得の途中」と出す（10/21）
         if run_info.get(k):
             hist[k] = run_info[k]
     append_jsonl(HISTORY_PATH, hist)
@@ -2050,7 +2082,7 @@ def fetch_all(repos, run, log, cap):
     elif result == "partial":
         notify("一部のリポジトリが取れませんでした", note or "")
     elif result == "stopped" and run_info.get("first_partial"):
-        notify("最初の取得の途中です", "1,500 回ずつ分けて取ります。続きは次の取得で取ります")
+        notify("最初の取得の途中です", "%s 回ずつ分けて取ります。続きは次の取得で取ります" % format(cap, ","))   # 設定の上限で言う（10/21）
     elif result == "stopped":
         notify("途中で止まりました", note or "")
     else:
