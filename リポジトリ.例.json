@@ -1,0 +1,4 @@
+[
+ {"id": 541269386, "name": "ggml-org/whisper.cpp", "tag": "音声", "base": "master", "stages": [], "from": "2026-07-22", "added": "2026-10-20"},
+ {"id": 123456789, "name": "your-name/your-repo", "tag": "自分", "base": "main", "stages": [], "from": "2026-01-15", "added": "2026-10-20"}
+]

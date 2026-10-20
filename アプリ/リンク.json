@@ -1,5 +1,5 @@
 {
- "checked": "2026-10-18（下書き。実装のときに開いて確かめる）",
+ "checked": "2026-10-20（5 つとも開けるのを確かめた。authorized_apps はログインしていないとログインの画面）",
  "gh_install": "https://cli.github.com/",
  "gh_login": "https://cli.github.com/manual/gh_auth_login",
  "sso": "https://docs.github.com/en/authentication/authenticating-with-saml-single-sign-on/about-authentication-with-saml-single-sign-on",
