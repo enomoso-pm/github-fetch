@@ -413,6 +413,7 @@ struct HistoryEntry: Codable, Identifiable {
     var calls: Int?
     var calls_free: Int?
     var failed: [String]?
+    var first_partial: Bool?   // 最初の取得の途中で上限に届いた回（「途中で止めた」と出さない。10/21。前の版の記録には無い）
     var id: String { (start ?? "") + "|" + (end ?? "") }
 }
 
@@ -803,6 +804,15 @@ final class Store: ObservableObject {
     var waitUntil: Date? { Fmt.parseISO(file.run?.wait_until) }
     /// 照合で確かめていないリポジトリ（最初の取得の途中・今回は途中で止まった など）。あれば照合のタイルを緑にしない
     var unverified: [UnverifiedRepo] { file.check?.unverified ?? [] }
+    /// 確かめていない・まだ読み切っていないリポジトリがあるか。あれば「照合 OK」「どれも取れています」と言わない（設計書 7.2・10/21）
+    var hasUnchecked: Bool { !unverified.isEmpty || repos.contains(where: \.incomplete) }
+    /// 確かめていないリポジトリの説明（「drawio（まだ一度も取っていない）」「…ほか 2」）
+    var uncheckedText: String {
+        let u = unverified.map { "\($0.repo)（\($0.reason)）" }
+        let p = u.isEmpty ? repos.filter(\.incomplete).map { r in r.tag + (r.pending.map { "（\($0)）" } ?? "") } : u
+        return p.prefix(2).joined(separator: "・") + (p.count > 2 ? " ほか \(p.count - 2)" : "")
+    }
+    var uncheckedCount: Int { unverified.isEmpty ? repos.filter(\.incomplete).count : unverified.count }
     /// まだ最後まで取れていないリポジトリの説明（「whisper.cpp（最初の取得の途中（PR 1,061 / 1,527 件まで））」）
     var pendingText: String {
         let p = repos.filter(\.incomplete).map { r in r.tag + (r.pending.map { ": \($0)" } ?? "") }
@@ -1220,11 +1230,14 @@ struct MenuRow: View {
 struct Pill: View {
     let result: String?
     let ng: Int?
+    var firstPartial = false
     var body: some View {
         let (text, fg, bg): (String, Color, Color) = {
             switch result {
             case "ok": return ("照合 OK", .okInk, .okWash)
             case "ng": return ("照合 NG \(ng ?? 0)件", .ngInk, .ngWash)
+            // 最初の取得の途中で上限に届いた回は「途中で止めた」と言わない（本人が止めたように読める。設計書 3.5・10/21）
+            case "stopped" where firstPartial: return ("最初の取得の途中", .warnInk, .warnWash)
             case "stopped": return ("途中で止めた", .warnInk, .warnWash)
             case "interrupted": return ("途中で終わった", .warnInk, .warnWash)   // 取得中にアプリや Mac が止まった（Slack 版と同じ）
             case "partial": return ("一部取れず", .warnInk, .warnWash)
@@ -1342,8 +1355,11 @@ struct StatusCard: View {
         .background(RoundedRectangle(cornerRadius: 12).fill(wash(s)))
     }
 
-    /// 黄色のカード（待てば戻る・一部だけ・古い・スリープで取れなかった）は、印を黒で描く
-    private func yellow(_ s: DisplayState) -> Bool { store.sleepMissed || s == .stale || s == .waiting || s == .partial }
+    /// 黄色のカード（最初の取得の途中・待てば戻る・一部だけ・古い・スリープで取れなかった）は、印を黒で描く
+    /// （最初の取得の途中だけ白で読みにくかった。設計書 7.2・10/21）
+    private func yellow(_ s: DisplayState) -> Bool {
+        store.sleepMissed || s == .stale || s == .waiting || s == .partial || s == .filling
+    }
 
     // スリープで取れなかったときは、照合 NG・失敗の代わりに、黄色に月の印で「もう一度取る」を促す（Slack 取得と同じ）
     private func iconName(_ s: DisplayState) -> String {
@@ -1396,6 +1412,9 @@ struct StatusCard: View {
         if let t = store.sleepMissedText { return t }
         let last = Fmt.relative(store.lastRunEnd, now: store.now)
         switch s {
+        case .ok where store.hasUnchecked:
+            // 確かめていないのに「照合 OK（すべて取れています）」と言わない（数え直しのあとなど。設計書 7.2・10/21）
+            return "\(last) に取得。\(store.uncheckedCount) リポジトリはまだ確かめていません: \(store.uncheckedText)。次の取得で確かめます"
         case .ok:
             return "\(last) に取得・照合 OK（\(store.repos.count) リポジトリすべて取れています）"
         case .running:
@@ -1471,26 +1490,15 @@ struct StatusCard: View {
                     .font(.system(size: 11)).foregroundStyle(Color.ink2)
             }
         case .ng:
-            VStack(alignment: .leading, spacing: 2) {
-                ForEach(Array(store.ngLines.prefix(2).enumerated()), id: \.offset) { _, line in
-                    Text(store.readable(line)).font(.system(size: 12)).foregroundStyle(Color.ink2)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                if store.ngLines.count > 2 {
-                    Text("ほか \(store.ngLines.count - 2)件").font(.system(size: 11)).foregroundStyle(Color.ink3)
-                }
-            }
-            .padding(.horizontal, 10).padding(.vertical, 8)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(RoundedRectangle(cornerRadius: 8).fill(.white))
-            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.ngLine, lineWidth: 1))
-            .padding(.top, 4)
+            ngBox
             HStack(spacing: 8) {
                 DadsButton(title: "もう一度取る", small: true) { store.runNow() }
                 DadsButton(title: "詳しく見る", kind: .quiet, small: true, action: openStatus)
             }
             .padding(.top, 6)
         case .failed, .filling:
+            // 途中で止まった・最初の取得の途中でも、照合 NG があれば理由を出す（照合のタイルは「見出しの下に理由」と言う。設計書 7.2・10/21）
+            if !store.ngLines.isEmpty { ngBox }
             HStack(spacing: 8) {
                 DadsButton(title: "今すぐ取る", small: true) { store.runNow() }
                 DadsButton(title: "取得ログを開く", kind: .quiet, small: true) { store.openLatestLog() }
@@ -1514,9 +1522,29 @@ struct StatusCard: View {
             DadsButton(title: "はじめの準備を開く", small: true) { AppDelegate.shared?.openSetup() }.padding(.top, 6)
         case .stale, .fresh:
             DadsButton(title: "今すぐ取る", small: true) { store.runNow() }.padding(.top, 6)
+        case .ok where store.hasUnchecked:
+            DadsButton(title: "今すぐ取る", small: true) { store.runNow() }.padding(.top, 6)   // 次の取得で確かめる
         case .ok:
             EmptyView()
         }
+    }
+
+    /// 照合 NG の理由の白い箱（2 行まで）
+    private var ngBox: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(Array(store.ngLines.prefix(2).enumerated()), id: \.offset) { _, line in
+                Text(store.readable(line)).font(.system(size: 12)).foregroundStyle(Color.ink2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if store.ngLines.count > 2 {
+                Text("ほか \(store.ngLines.count - 2)件").font(.system(size: 11)).foregroundStyle(Color.ink3)
+            }
+        }
+        .padding(.horizontal, 10).padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 8).fill(.white))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.ngLine, lineWidth: 1))
+        .padding(.top, 4)
     }
 }
 
@@ -1829,6 +1857,8 @@ struct StatePill: View {
     private var spec: (String, String, Color, Color) {
         if store.sleepMissed { return ("moon", "スリープで取れなかった", .warnInk, .warnWash) }
         switch store.display {
+        case .ok where store.hasUnchecked:   // 照合のタイルの黄とそろえる（設計書 7.2・10/21）
+            return ("questionmark.circle.fill", "最新・まだ確かめていない所あり", .warnInk, .warnWash)
         case .ok: return ("checkmark.circle.fill", "最新・照合 OK", .okInk, .okWash)
         case .running:
             let p = store.file.state == "running" ? store.file.run?.progress : nil
@@ -2009,7 +2039,7 @@ struct HistoryCard: View {
                     GridRow {
                         Text(Fmt.relative(Fmt.parseISO(e.start), now: store.now)).font(.system(size: 12))
                         HStack(spacing: 6) {
-                            Pill(result: e.result, ng: e.ng)
+                            Pill(result: e.result, ng: e.ng, firstPartial: e.first_partial == true)
                             if e.sleep != nil || e.delayed_from != nil { SleepBadge() }
                         }
                         Text("+\(Fmt.number(e.new ?? 0))").font(.system(size: 12)).monospacedDigit()
@@ -2346,7 +2376,9 @@ struct QuietTable: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline) {
                 Text("この14日に動きのないリポジトリ（\(repos.count)）").font(.system(size: 12, weight: .bold)).foregroundStyle(Color.ink)
-                Text("動きがないだけで、どれも取れています").font(.system(size: 11)).foregroundStyle(Color.ink3)
+                // 「どれも取れています」は、表の全部が読み切ってあるときだけ（行が「まだ最後まで取れていません」と言うときに逆のことを言わない。10/21）
+                Text(repos.contains(where: \.incomplete) ? "まだ読み切っていないものがあります" : "動きがないだけで、どれも取れています")
+                    .font(.system(size: 11)).foregroundStyle(Color.ink3)
             }
             Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 7) {
                 GridRow {
@@ -2724,14 +2756,26 @@ struct StatusContent: View {
                 DadsButton(title: "もう一度取る", small: true) { store.runNow() }
             }
         case .failed:
-            noticeLine("exclamationmark.circle.fill", .ngInk,
-                       "\(store.file.run?.note ?? "くわしくは取得ログを見てください")。取れた分は残っています。もう一度動かせば、続きから取ります") {
-                EmptyView()
+            VStack(alignment: .leading, spacing: 6) {
+                noticeLine("exclamationmark.circle.fill", .ngInk,
+                           "\(store.file.run?.note ?? "くわしくは取得ログを見てください")。取れた分は残っています。もう一度動かせば、続きから取ります") {
+                    EmptyView()
+                }
+                ngNotice
             }
         case .filling:
-            noticeLine("hourglass", .warnInk,
-                       "最初の取得の途中です。\(store.callCapText)ずつ分けて取ります" + (store.pendingText.isEmpty ? "" : "。いま \(store.pendingText)")
-                           + "。取れた分は残っていて、続きは次の取得（今すぐ取る・毎朝）で取ります") {
+            VStack(alignment: .leading, spacing: 6) {
+                noticeLine("hourglass", .warnInk,
+                           "最初の取得の途中です。\(store.callCapText)ずつ分けて取ります" + (store.pendingText.isEmpty ? "" : "。いま \(store.pendingText)")
+                               + "。取れた分は残っていて、続きは次の取得（今すぐ取る・毎朝）で取ります") {
+                    DadsButton(title: "今すぐ取る", small: true) { store.runNow() }
+                }
+                ngNotice
+            }
+        case .ok where store.hasUnchecked:
+            // 最新でも、確かめていないリポジトリがあれば、理由と次の一手を出す（設計書 7.2・10/21）
+            noticeLine("questionmark.circle.fill", .warnInk,
+                       "まだ確かめていないリポジトリがあります: \(store.uncheckedText)。次の取得で確かめます") {
                 DadsButton(title: "今すぐ取る", small: true) { store.runNow() }
             }
         case .login:
@@ -2756,6 +2800,17 @@ struct StatusContent: View {
             }
         default:
             EmptyView()
+        }
+    }
+
+    /// 途中で止まった・最初の取得の途中のときの、照合 NG の理由の 1 行（照合のタイルは「見出しの下に理由」と言う。設計書 7.2・10/21）
+    @ViewBuilder private var ngNotice: some View {
+        if !store.ngLines.isEmpty {
+            noticeLine("exclamationmark.triangle.fill", .ngInk,
+                       "照合 NG \(store.ngLines.count)件: " + store.ngLines.prefix(2).map(store.readable).joined(separator: "／")
+                           + (store.ngLines.count > 2 ? "（ほか \(store.ngLines.count - 2)件）" : "")) {
+                EmptyView()
+            }
         }
     }
 
@@ -2813,7 +2868,7 @@ struct StatusContent: View {
                  value: !store.ngLines.isEmpty ? "NG \(store.ngLines.count)件" : (store.unverified.isEmpty ? "OK" : "確かめていない"),
                  note: !store.ngLines.isEmpty ? "見出しの下に理由"
                      : (store.unverified.isEmpty ? "\((store.file.check?.items ?? []).count)項目すべて OK・抜けなし"
-                        : "確かめていない所があります（\(store.unverified.count) リポジトリ）"),
+                        : "\(store.unverified.count) リポジトリはまだ確かめていない"),   // 前の文はタイルの幅で切れた（10/21）
                  valueColor: !store.ngLines.isEmpty ? .ngInk : (store.unverified.isEmpty ? .okInk : .warnInk))
                 .hoverTip(alignTrailing: true, forced: store.previewTip == "check") { checkTip }
             Tile(label: "使った回数（今回）", value: "\(Fmt.number(store.file.run?.calls ?? 0)) 回",
@@ -2885,7 +2940,10 @@ struct StatusContent: View {
 
     private var checkTip: some View {
         VStack(alignment: .leading, spacing: 8) {
-            TipTitle(text: "照合で確かめていること（\(Fmt.relative(store.lastRunEnd, now: store.now)) の取得のあと）")
+            // いつの取得の材料で確かめたか（数え直しのあとも、材料の回を言う。設計書 5 章・10/21）
+            TipTitle(text: "照合で確かめていること（" + (Fmt.parseISO(store.file.check?.checked_at).map {
+                "\(Fmt.relative($0, now: store.now)) の取得で確かめた"
+            } ?? "\(Fmt.relative(store.lastRunEnd, now: store.now)) の取得のあと") + "）")
             VStack(alignment: .leading, spacing: 7) {
                 ForEach(store.file.check?.items ?? []) { i in
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -3041,6 +3099,33 @@ enum Snapshot {
         prepare(unv, .filling)
         unv.previewTip = "check"
         render(StatusContent().environmentObject(unv), to: "\(dir)/window_tip_check_unverified.png", width: 1000)
+        // 最新でも、確かめていないリポジトリがあるとき（足したばかりのリポジトリを数え直したあと）。「照合 OK」と言わない（設計書 7.2・10/21）
+        let ou = Store(live: false)
+        prepare(ou, .ok)
+        if let last = ou.file.repos?.indices.last {
+            let tag = ou.file.repos?[last].tag ?? "作図"
+            ou.file.repos?[last].complete = false
+            ou.file.repos?[last].pending = "まだ一度も取っていない"
+            ou.file.check?.unverified = [UnverifiedRepo(repo: tag, reason: "まだ一度も取っていない")]
+            for j in (ou.file.check?.items ?? []).indices {
+                ou.file.check?.items?[j].ok = false
+                ou.file.check?.items?[j].state = "unverified"
+            }
+        }
+        render(PopoverView().environmentObject(ou), to: "\(dir)/menu_ok_unverified.png", width: 380)
+        render(StatusContent().environmentObject(ou), to: "\(dir)/window_ok_unverified.png", width: 1000)
+        // 最初の取得の途中に、読み切った小さいリポジトリで照合 NG があるとき。理由を見出しの下と小窓に出す（設計書 7.2・10/21）。
+        // 取得の記録の 1 行目は、最初の取得の途中で上限に届いた回（「途中で止めた」と言わない）
+        let fn = Store(live: false)
+        prepare(fn, .filling)
+        fn.file.check?.ng = ["NG 作図: 開いている PR と issue が GitHub 1 / 記録 0"]
+        if !fn.history.isEmpty {
+            fn.history[0].result = "stopped"
+            fn.history[0].first_partial = true
+            fn.history[0].note = "1回の上限（1,500 回）に届いた"
+        }
+        render(PopoverView().environmentObject(fn), to: "\(dir)/menu_filling_ng.png", width: 380)
+        render(StatusContent().environmentObject(fn), to: "\(dir)/window_filling_ng.png", width: 1000)
         // 棒にマウスを乗せたとき・取得の記録を全部開いたとき
         let s = Store(live: false)
         s.previewBar = (s.file.daily ?? []).dropLast(2).last.flatMap { Fmt.parseJST($0.date + " 12:00:00") }.map { Fmt.string($0, "M/d") }
@@ -3265,6 +3350,36 @@ enum BaseTest {
     }
 }
 
+// MARK: - 確かめ用: 取る係が書いた状態.json を読めるか
+
+enum StateTest {
+    /// 取る係（github.py）が書いた状態.json を、アプリの型（StateFile）で読めるか確かめる（設計書 9.3・10/21。X-3）。
+    /// アプリはふだん、型どおりに読めないと黙って前の表示のまま止まる（load の try?）ので、試しではここで落とす。
+    /// 使い方: GitHubFetch --test-state <状態.json> …（取る係の試し fetch_test.py が、いろいろな場面の状態.json を渡す）
+    static func run(_ files: [String]) -> Int32 {
+        var ng = 0
+        for path in files {
+            do {
+                let data = try Data(contentsOf: URL(fileURLWithPath: path))
+                let f = try JSONDecoder().decode(StateFile.self, from: data)
+                // 読めた数が、ファイルの数と同じか（欄の名前が食い違うと、黙って空になる）
+                let raw = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
+                let check = raw["check"] as? [String: Any] ?? [:]
+                let same = (f.check?.items?.count ?? 0) == ((check["items"] as? [Any])?.count ?? 0)
+                    && (f.check?.unverified?.count ?? 0) == ((check["unverified"] as? [Any])?.count ?? 0)
+                    && (f.repos?.count ?? 0) == ((raw["repos"] as? [Any])?.count ?? 0)
+                print((same ? "OK  " : "NG  ") + "\(path)（state \(f.state ?? "-")・照合の項目 \(f.check?.items?.count ?? 0)"
+                      + "・確かめていない \(f.check?.unverified?.count ?? 0)・リポジトリ \(f.repos?.count ?? 0)）")
+                if !same { ng += 1 }
+            } catch {
+                print("NG  \(path) を読めない: \(error)")
+                ng += 1
+            }
+        }
+        return ng == 0 && !files.isEmpty ? 0 : 1
+    }
+}
+
 // MARK: - 確かめ用: グラフのマウスの位置
 
 enum ChartTest {
@@ -3365,7 +3480,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     override init() {
         store = Store(live: !CommandLine.arguments.contains("--snapshot") && !CommandLine.arguments.contains("--icon")
                       && !CommandLine.arguments.contains("--test-base") && !CommandLine.arguments.contains("--test-setup")
-                      && !CommandLine.arguments.contains("--test-chart"))
+                      && !CommandLine.arguments.contains("--test-chart") && !CommandLine.arguments.contains("--test-state"))
         super.init()
         AppDelegate.shared = self
     }
@@ -3449,6 +3564,9 @@ struct GitHubFetchApp: App {
         }
         if args.contains("--test-chart") {
             exit(ChartTest.run())
+        }
+        if let i = args.firstIndex(of: "--test-state") {
+            exit(StateTest.run(Array(args[(i + 1)...])))
         }
         if let i = args.firstIndex(of: "--icon"), i + 1 < args.count {
             Snapshot.render(AppIconView(), to: args[i + 1], width: 1024, scale: 1)

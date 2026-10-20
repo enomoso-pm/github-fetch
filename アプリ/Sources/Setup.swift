@@ -194,6 +194,13 @@ final class Setup: ObservableObject {
     var onSaved: (() -> Void)?
     private var lastStatus: SetupStatus?
     private var process: Process?
+    /// 動いている準備の処理のあとに、順番を待っているもの。準備の処理（--login・--find・--inspect）は 1 つずつ動かす。
+    /// どれも候補のファイルを最初に読んで最後に書くので、2 つ同時に動くと後から書いた方が残り、先の結果が消える（設計書 4.9・10/21）
+    private var waiting: [(args: [String], done: (Outcome) -> Void)] = []
+    /// 一度調べたリポジトリ（調べても見込みが届かなかったものを、続けて調べ直し続けないため）
+    private var inspectTried: Set<Int> = []
+    /// 準備の処理が動いているか（自己試験が、全部終わるまで待つのに使う）
+    var helperRunning: Bool { process != nil || !waiting.isEmpty }
 
     var busy: Bool { conn == .checking || searchingFor != nil }
 
@@ -280,10 +287,20 @@ final class Setup: ObservableObject {
 
     private enum Outcome { case finished(SetupStatus?), cannotRun(String) }
 
-    /// 終わったら done を呼ぶ。finished には、今回書かれた結果だけを渡す（前の回の結果は渡さない）
+    /// 終わったら done を呼ぶ。finished には、今回書かれた結果だけを渡す（前の回の結果は渡さない）。
+    /// ほかの準備の処理が動いていれば、順番を待つ（1 つずつ動かす）
     private func runHelper(_ args: [String], done: @escaping (Outcome) -> Void) {
+        guard process == nil else {
+            waiting.append((args, done))
+            return
+        }
+        startHelper(args, done: done)
+    }
+
+    private func startHelper(_ args: [String], done: @escaping (Outcome) -> Void) {
         guard FileManager.default.fileExists(atPath: Paths.script.path) else {
             done(.cannotRun("取得の仕組みのフォルダに github.py が見つかりません。設定（歯車）でフォルダを選び直してください。"))
+            nextHelper()
             return
         }
         let p = Process()
@@ -303,6 +320,7 @@ final class Setup: ObservableObject {
                 self.loadCandidates()
                 let fresh = (Fmt.parseISO(self.lastStatus?.at) ?? .distantPast) >= started
                 done(.finished(fresh ? self.lastStatus : nil))
+                self.nextHelper()
             }
         }
         do {
@@ -310,7 +328,24 @@ final class Setup: ObservableObject {
             process = p
         } catch {
             done(.cannotRun("準備の台本を動かせませんでした: \(error.localizedDescription)"))
+            nextHelper()
         }
+    }
+
+    /// 順番を待っている処理を動かす。無ければ、見込みがまだ無い選んだリポジトリを調べる
+    /// （調べている数秒の間に付けた 2 つ目も調べる。前は調べず、大きいリポジトリでも「作った日から」のまま残った。W-1）
+    private func nextHelper() {
+        guard process == nil else { return }
+        if !waiting.isEmpty {
+            let w = waiting.removeFirst()
+            startHelper(w.args, done: w.done)
+            return
+        }
+        let need = picked.first { p in
+            p.fromKind != .saved && !inspecting.contains(p.id) && !inspectTried.contains(p.id)
+                && candidates.contains { $0.id == p.id && ($0.estimate == nil || $0.hint == nil) }
+        }
+        if let p = need { inspect(p.id) }
     }
 
     /// 「ログインを確かめる」: gh が入っているか・ログインしているか・本当に読めるかを確かめ、見えるリポジトリの一覧を読む
@@ -373,11 +408,13 @@ final class Setup: ObservableObject {
         }
     }
 
-    /// 選んだリポジトリの、基準のブランチの提案と、最初の取得の見込みを調べる（まだ無いときだけ。数回の問い合わせ）
+    /// 選んだリポジトリの、基準のブランチの提案と、最初の取得の見込みを調べる（まだ無いときだけ。数回の問い合わせ）。
+    /// ほかの処理が動いていれば順番を待つ。待っている間も「見込みを調べています…」と出す
     func inspect(_ id: Int) {
         guard let c = candidates.first(where: { $0.id == id }), c.estimate == nil || c.hint == nil,
-              !inspecting.contains(id), process == nil else { return }
+              !inspecting.contains(id) else { return }
         inspecting.insert(id)
+        inspectTried.insert(id)
         runHelper(["--inspect", c.name]) { [weak self] _ in
             self?.inspecting.remove(id)
         }
@@ -517,9 +554,12 @@ final class Setup: ObservableObject {
 
     /// 1回の取得で使ってよい回数（設定。0 は上限なし）
     static var callCap: Int {
+        if let t = testCallCap { return t }
         let v = UserDefaults.standard.object(forKey: "callCap") as? Int ?? 1500
         return v == 0 ? Int.max : v
     }
+    /// 自己試験だけが使う（本物の設定の上限を読まない。10/21）
+    static var testCallCap: Int?
 
     // ---- 次へ ----
 
@@ -1609,6 +1649,8 @@ enum SetupTest {
         let root = fm.temporaryDirectory.appendingPathComponent("github-fetch-setup-test-\(ProcessInfo.processInfo.processIdentifier)")
         Paths.dataOverride = root.appendingPathComponent(Paths.dataFolderName)   // 取ったデータの場所も一時フォルダの中
         defer { try? fm.removeItem(at: root) }
+        Setup.testCallCap = 1500   // 1 回の上限も、本物の設定を読まない（10/21）
+        defer { Setup.testCallCap = nil }
         var ng = 0
         func check(_ name: String, _ ok: Bool) { print((ok ? "OK  " : "NG  ") + name); if !ok { ng += 1 } }
         func text(_ u: URL) -> String { (try? String(contentsOf: u, encoding: .utf8)) ?? "" }
@@ -1719,6 +1761,44 @@ enum SetupTest {
             s.useSuggested(1010)
             check("「develop を基準にする」で develop になり、注意が消える",
                   s.picked.first { $0.id == 1010 }.map { !$0.baseWarning && $0.base == "develop" } == true)
+
+            // 続けて 2 つにチェックを付けても、2 つとも見込みを調べる（準備の処理は 1 つずつ動き、順番を待ったものも調べる。W-1・10/21）。
+            // 見込みを調べる処理を本当に動かす: --inspect で呼ばれた名前に見込みを書いて返す小さな台本（GitHub には問い合わせない）
+            let stub = """
+            import datetime, json, os, sys, time
+            d = os.environ["GITHUB_FETCH_DATA"]
+            p = os.path.join(d, "リポジトリ候補.json")
+            f = json.load(open(p, encoding="utf-8")) if os.path.exists(p) else {}
+            name = sys.argv[3] if len(sys.argv) > 3 and sys.argv[2] == "--inspect" else ""
+            time.sleep(0.3)
+            for r in f.get("repos") or []:
+                if r.get("name") == name:
+                    r["estimate"] = {"all": 9000, "days90": 300}
+                    r["hint"] = {}
+            f["last"] = {"mode": "inspect", "at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"), "ok": True, "found": 1}
+            json.dump(f, open(p, "w", encoding="utf-8"), ensure_ascii=False)
+            open(os.path.join(d, "調べた.log"), "a", encoding="utf-8").write(name + "\\n")
+            """
+            try stub.write(to: Paths.script, atomically: true, encoding: .utf8)
+            func waitHelpers() {   // 準備の処理が全部終わるまで待つ（終わりの知らせは、メインの流れで受け取る）
+                let deadline = Date().addingTimeInterval(20)
+                while s.helperRunning && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
+            }
+            waitHelpers()   // 上の試しで付けたものの見込み調べ（順番を待っていた分）を、先に流し切る
+            try? fm.removeItem(at: Paths.data.appendingPathComponent("調べた.log"))
+            try "{\"repos\": [{\"id\": 1021, \"name\": \"test-owner/first\", \"created\": \"2020-01-01\"}, {\"id\": 1022, \"name\": \"test-owner/second\", \"created\": \"2020-01-01\"}]}"
+                .write(to: Paths.candidates, atomically: true, encoding: .utf8)
+            s.closeNow(); s.open()
+            if let c1 = s.candidates.first(where: { $0.id == 1021 }), let c2 = s.candidates.first(where: { $0.id == 1022 }) {
+                s.toggle(c1); s.toggle(c2)   // 1 つ目を調べている間に、2 つ目にチェック
+            }
+            let queuedBoth = s.inspecting == [1021, 1022]
+            waitHelpers()
+            let asked = text(Paths.data.appendingPathComponent("調べた.log")).split(separator: "\n").map(String.init)
+            check("続けて 2 つにチェックを付けても、2 つとも見込みを調べる（1 つずつ順に: \(asked.joined(separator: " → "))）",
+                  queuedBoth && asked == ["test-owner/first", "test-owner/second"] && s.inspecting.isEmpty)
+            check("順番を待った 2 つ目も見込みが届き、大きいので「90日前から」に選び直す",
+                  s.picked.first { $0.id == 1022 }?.estimate?.all == 9000 && s.picked.first { $0.id == 1022 }?.fromKind == .days90)
 
             // 記録のファイル: 2つが同時に書いても上書きしない（Slack 取得で 2026-10-09 に起きた順番を再現）
             guard let first = Store.appLog("状況の数え直し"), let second = Store.appLog("取得") else {
