@@ -940,6 +940,11 @@ def who(u):
     return u.get("login"), u.get("id")
 
 
+def is_bot(u):
+    """ボットか。GitHub の返事のアカウントの種類だけで決める（名前では決めない。手の一覧も作らない。設計書 3.3）"""
+    return (u or {}).get("type") == "Bot"
+
+
 def commit_graph(raws):
     """コミットの親子（sha → 親・題名・作った人・日時・知った時刻）"""
     g = {}
@@ -1161,14 +1166,16 @@ def build_records(cfg):
         it = issue_items.get(n) or {}
         if not p and not it:
             continue
-        a, aid = who(p.get("user") or it.get("user"))
+        user = p.get("user") or it.get("user")
+        a, aid = who(user)
         ms = it.get("milestone") or p.get("milestone") or {}
         pr_rows.append({
             "number": n, "title": p.get("title") or it.get("title"), "state": p.get("state") or it.get("state"),
             "draft": p.get("draft"), "merged_at": p.get("merged_at"), "merge_commit_sha": p.get("merge_commit_sha") if p.get("merged_at") else None,
             "head_sha": (p.get("head") or {}).get("sha"), "head_ref": (p.get("head") or {}).get("ref"),
             "head_repo": ((p.get("head") or {}).get("repo") or {}).get("full_name"),
-            "base": (p.get("base") or {}).get("ref"), "author": a, "author_id": aid,
+            "base": (p.get("base") or {}).get("ref"), "author": a, "author_id": aid, "bot": is_bot(user),
+            "author_association": p.get("author_association") or it.get("author_association"),
             "created_at": p.get("created_at") or it.get("created_at"), "updated_at": max(p.get("updated_at") or "", it.get("updated_at") or ""),
             "closed_at": p.get("closed_at") or it.get("closed_at"),
             "labels": [l.get("name") for l in (it.get("labels") or p.get("labels") or []) if isinstance(l, dict)],
@@ -1187,7 +1194,8 @@ def build_records(cfg):
         ms = it.get("milestone") or {}
         issue_rows.append({
             "number": n, "title": it.get("title"), "state": it.get("state"), "state_reason": it.get("state_reason"),
-            "author": a, "author_id": aid, "created_at": it.get("created_at"), "updated_at": it.get("updated_at"),
+            "author": a, "author_id": aid, "bot": is_bot(it.get("user")), "author_association": it.get("author_association"),
+            "created_at": it.get("created_at"), "updated_at": it.get("updated_at"),
             "closed_at": it.get("closed_at"), "labels": [l.get("name") for l in it.get("labels") or [] if isinstance(l, dict)],
             "assignees": [{"login": x.get("login"), "id": x.get("id")} for x in it.get("assignees") or []],
             "milestone": {"title": ms.get("title"), "due_on": ms.get("due_on")} if ms else None,
@@ -1217,6 +1225,7 @@ def build_records(cfg):
                     m = re.search(r"/pulls/([0-9]+)/reviews", meta.get("where") or "")
                     number = int(m.group(1)) if m else None
                 row = {"id": c["id"], "kind": ckind, "number": number, "author": a, "author_id": aid,
+                       "bot": is_bot(c.get("user")), "author_association": c.get("author_association"),
                        "created_at": c.get("created_at") or c.get("submitted_at"),
                        "updated_at": c.get("updated_at") or c.get("submitted_at"), "body": c.get("body"),
                        "known_at": (comments.get(key) or {}).get("known_at") or meta.get("fetched_at"),
@@ -1262,7 +1271,7 @@ def build_records(cfg):
             iss = e.get("issue") or {}
             events[e["id"]] = {"id": e["id"], "event": e.get("event"), "at": e.get("created_at"),
                                "number": iss.get("number"), "pr": bool(iss.get("pull_request")),
-                               "actor": a, "actor_id": aid, "bot": ((e.get("actor") or {}).get("type") == "Bot"),
+                               "actor": a, "actor_id": aid, "bot": is_bot(e.get("actor")),
                                "detail": detail, "known_at": meta.get("fetched_at"), "untrusted": untrusted}
     write_jsonl(os.path.join(rec, "出来事.jsonl"), sorted(events.values(), key=lambda r: (r["at"] or "", r["id"])))
 
@@ -1415,10 +1424,14 @@ def repo_stats(cfg, run_start=None, keep_delta=None):
     else:
         delta = keep_delta
     landed_times = [u["at"] for u in units if u.get("at")]
+    # 取り始める日を前にずらして、まだ古い分を足し終えていないあいだは、数えた範囲は前に読み切ったときの日から（設計書 3.4・Y-5）
+    read_from = bm.get("read_from")
+    counted_from = read_from if read_from and cfg.get("from") and read_from > cfg["from"] else None
     return {
         "id": int(cfg["id"]), "tag": cfg.get("tag") or cfg["name"], "name": facts.get("full_name") or cfg["name"],
         "base": cfg.get("base") or "main", "visibility": facts.get("visibility"), "archived": facts.get("archived"),
-        "from": cfg.get("from"), "fetched": local_iso(bm.get("last_success")), "error": None, "error_kind": None,
+        "from": cfg.get("from"), "counted_from": counted_from,
+        "fetched": local_iso(bm.get("last_success")), "error": None, "error_kind": None,
         # 一度も最後まで読み切っていないリポジトリを、画面で「取れています」と出さない（設計書 3.4・5 章）
         "complete": bool(bm.get("last_success")), "pending": pending_reason(bm, rdir),
         "total": len(units), "total_pr": sum(1 for u in units if u["pr"]), "delta": delta,
@@ -1515,10 +1528,10 @@ def check_repo(cfg, built=None, run_start=None):
     if run_start is None:
         if bm.get("attempt") and bm["attempt"] != f.get("started"):
             # 取りかかった回が途中で止まった。止まった回が進めた記録と、その前の回の材料を比べると、逆向きの NG が出る（V6）
-            return ng, notes, {}, "前の取得が途中で止まった・次の取得で確かめる"
+            return ng, notes, {}, "前の取得が途中で止まった"   # 「次の取得で確かめます」は画面の文で 1 回だけ言う（Y-6）
         moved = moved_since_read(bm, cfg)
         if moved:
-            return ng, notes, {}, "%s・次の取得で確かめる" % moved   # 保存した直後に NG にしない（V7。設計書 4.9）
+            return ng, notes, {}, moved   # 保存した直後に NG にしない（V7。設計書 4.9）
     stat = {"checked_at": f.get("started")}
     for n in f.get("notes") or []:   # 取る係の注記（名前が変わっていました・古い分を足しました など）も、照合の注記に出す
         notes.append("%s: %s" % (tag, n))
@@ -1527,10 +1540,15 @@ def check_repo(cfg, built=None, run_start=None):
         ng["ページの取りこぼし"].append("%s: %s が取り直しても取れなかった" % (tag, what))
     # 件数の突き合わせ（取り始めた日より後に作られたもの）。作者のアカウントが消された PR・issue は、検索に出るものと
     # 出ないものがある（whisper.cpp では PR 3 件が出ず、issue #3983 は出た）。決め打ちせず、記録にあって検索に出ない数が
-    # 0 から消されたものの数までなら NG にしない（設計書 5 章・10/21 本人の指示。前は PR だけ必ず除き、検索に出るリポジトリで NG になった）
+    # 0 から消されたものの数までなら NG にしない（設計書 5 章・10/21 本人の指示。前は PR だけ必ず除き、検索に出るリポジトリで NG になった）。
+    # 合った回の「検索に出ない数」と「消されたものの数」をしおりに覚え（取得の回だけ。fetch_all が書く）、次からは
+    # 覚えた数より減ったら NG（幅の中の取りこぼし。設計書 5 章・レビュー 6 回目の Y-1）
     start = start_of(cfg)
+    base = cfg.get("base") or "main"
     prs = read_jsonl(os.path.join(rec, "PR.jsonl"))
     issues = read_jsonl(os.path.join(rec, "issue.jsonl"))
+    basis_all = bm.get("count_basis") or {}
+    stat["count_basis"] = {}
     for kind, rows_, label in (("pr", prs, "PR"), ("issue", issues, "issue")):
         s = f.get("search_" + kind) or {}
         if s.get("total") is None:
@@ -1540,13 +1558,26 @@ def check_repo(cfg, built=None, run_start=None):
         total = s["total"]
         hidden = len(mine_rows) - total   # 記録にあって、GitHub の検索に出ない数
         stat[kind] = (total, len(mine_rows) - max(0, min(hidden, len(ghosts))))
+        basis = basis_all.get(kind)
+        if basis and (basis.get("from") != cfg.get("from") or basis.get("base") != base):
+            basis = None   # 取り始める日か基準のブランチを変えたら、覚えた数は使わない
+        low, high = 0, len(ghosts)
+        if basis:
+            # 消されたものが増えた分だけ、検索に出ない数は増えてよい（減った分だけ、減ってよい）
+            low = max(0, basis["hidden"] - max(0, basis["ghosts"] - len(ghosts)))
+            high = min(len(ghosts), basis["hidden"] + max(0, len(ghosts) - basis["ghosts"]))
         if s.get("incomplete"):
             notes.append("%s: GitHub の検索の数が途中までだった（%s）" % (tag, label))
-        elif 0 <= hidden <= len(ghosts):
+        elif low <= hidden <= high:
+            stat["count_basis"][kind] = {"hidden": hidden, "ghosts": len(ghosts), "from": cfg.get("from"), "base": base,
+                                         "at": f.get("started")}
             if hidden:
                 notes.append("%s: 作者のアカウントが消された %s %d 件（%s）%sは、GitHub の検索に出ないので、数から外して比べました"
                              % (tag, label, len(ghosts), "・".join("#%d" % r["number"] for r in ghosts[:5]),
                                 "" if hidden == len(ghosts) else "のうち %d 件" % hidden))
+        elif basis and 0 <= hidden < low:
+            ng["件数の突き合わせ"].append("%s: %s が GitHub %s / 取れた %s（前に合ったときは、検索に出ない %s が %d 件。いまは %d 件。取りこぼしの疑い）" % (
+                tag, label, format(total, ","), format(len(mine_rows), ","), label, basis["hidden"], hidden))
         else:
             ng["件数の突き合わせ"].append("%s: %s が GitHub %s / 取れた %s%s" % (
                 tag, label, format(total, ","), format(len(mine_rows), ","),
@@ -1697,7 +1728,7 @@ def run_checks(repos, built_map=None, skip=None, run_start=None):
             total[k].extend(v)
         notes.extend(nt)
         stats[cfg["id"]] = st
-        checked_at.append(st.get("checked_at"))
+        checked_at.append((tag, st.get("checked_at")))
     known = []
     for k in CHECK_NAMES:
         keep = []
@@ -1734,16 +1765,21 @@ def run_checks(repos, built_map=None, skip=None, run_start=None):
             items.append({"name": k, "ok": False, "state": "ng",
                           "detail": "・".join(total[k][:3]) + ("ほか %d" % (len(total[k]) - 3) if len(total[k]) > 3 else "")})
         elif unverified:
-            detail = "確かめていない: %s" % pend
+            detail = "確かめていない（次の取得で確かめる）: %s" % pend
             if n_repos:
                 detail += "。確かめた %d リポジトリは OK（%s）" % (n_repos, ok_detail[k])
             items.append({"name": k, "ok": False, "state": "unverified", "detail": detail})
         else:
             items.append({"name": k, "ok": True, "state": "ok", "detail": ok_detail[k]})
     ng_lines = ["NG %s" % line for k in CHECK_NAMES for line in total[k]]   # 頭は Slack 版と同じ「NG 」
-    stamps = [c for c in checked_at if c]
+    stamps = [t for _, t in checked_at if t]
+    newest = max(stamps) if stamps else None
     check = {"ng": ng_lines, "notes": notes, "items": items, "exceptions": known, "unverified": unverified,
-             "checked_at": local_iso(max(stamps)) if stamps else None}
+             "checked_at": local_iso(newest) if newest else None}
+    # 前の回の材料で確かめたリポジトリ（数え直しで、前の取得がほかのリポジトリの途中で止まったとき。設計書 5 章・Y-2）
+    old = [{"repo": tag, "at": local_iso(t)} for tag, t in checked_at if t and t != newest]
+    if old:
+        check["checked_old"] = old
     return check, total, stats
 
 
@@ -2018,6 +2054,13 @@ def fetch_all(repos, run, log, cap):
         except (Stop, RepoError) as e:
             log.line("取り直しの途中で止まった: %s" % getattr(e, "message", e))
         check, by_item, cstats = run_checks(repos, built, skip=skip, run_start=run_start)
+    # 件数の突き合わせが合った数を、しおりに覚える（取得の回だけ。次の回から、減ったら NG。設計書 5 章・レビュー 6 回目の Y-1）
+    for c in repos:
+        cb = (cstats.get(c["id"]) or {}).get("count_basis")
+        if cb:
+            bm = read_json(bm_path(repo_dir(c)), {}) or {}
+            bm.setdefault("count_basis", {}).update(cb)
+            write_json(bm_path(repo_dir(c)), bm)
     stats = all_stats(repos, run_start=iso_z(run.started))
     if stop is not None:
         result, note = stop_result(stop)
