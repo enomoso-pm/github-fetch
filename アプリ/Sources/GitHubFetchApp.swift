@@ -337,6 +337,7 @@ struct RepoInfo: Codable, Identifiable {
     var pr_flags: PRFlags?
     var active: [ActiveItem]?
     var counts: RepoCounts?
+    var counted_from: String?   // 数えた範囲の始まりの日（取り始める日を前にずらして、まだ古い分を足し終えていないあいだだけ。設計書 3.4・Y-5）
     var complete: Bool?         // 一度でも最後まで読み切ったか（無ければ読み切った扱い。前の版の状態.json）
     var pending: String?        // 読み切っていない理由（「最初の取得の途中（PR 1,061 / 1,527 件まで）」など）
 
@@ -367,6 +368,12 @@ struct UnverifiedRepo: Codable, Hashable {
     var reason: String
 }
 
+/// 前の回の材料で確かめたリポジトリ（数え直しで、前の取得がほかのリポジトリの途中で止まったとき。設計書 5 章・Y-2）
+struct CheckedOld: Codable, Hashable {
+    var repo: String
+    var at: String?
+}
+
 struct CheckInfo: Codable {
     var ng: [String]
     var notes: [String]?
@@ -374,6 +381,7 @@ struct CheckInfo: Codable {
     var items: [CheckItem]?
     var unverified: [UnverifiedRepo]?
     var checked_at: String?     // 照合の材料を取った回の時刻（数え直しのとき、いつの取得で確かめたか）
+    var checked_old: [CheckedOld]?   // 前の回の材料で確かめたリポジトリ（Y-2）
 }
 
 /// 日ごとに入った数（呼び名ごと）。pr はそのうち PR 経由の数（直接は counts − pr）
@@ -896,7 +904,7 @@ final class Store: ObservableObject {
         var out: [String] = []
         if let s = file.run?.sleep {
             out.append("取得の途中で Mac がスリープしていました（\(Store.sleepWhen(s))）。"
-                       + (display == .ok ? "その間は止まっていましたが、全部取れています" : "その間は取得が止まっていました"))
+                       + (display == .ok && !hasUnchecked ? "その間は止まっていましたが、全部取れています" : "その間は取得が止まっていました"))   // 確かめていない所があれば「全部取れています」と言わない（Y-4）
         }
         if let d = delayedText { out.append(d) }
         return out
@@ -1358,14 +1366,16 @@ struct StatusCard: View {
     /// 黄色のカード（最初の取得の途中・待てば戻る・一部だけ・古い・スリープで取れなかった）は、印を黒で描く
     /// （最初の取得の途中だけ白で読みにくかった。設計書 7.2・10/21）
     private func yellow(_ s: DisplayState) -> Bool {
-        store.sleepMissed || s == .stale || s == .waiting || s == .partial || s == .filling
+        store.sleepMissed || s == .stale || s == .waiting || s == .partial || s == .filling || unchecked(s)
     }
+    /// 最新でも、確かめていないリポジトリがある（ピルの黄とそろえて、カードも黄の「?」にする。設計書 7.2・Y-3）
+    private func unchecked(_ s: DisplayState) -> Bool { s == .ok && store.hasUnchecked }
 
     // スリープで取れなかったときは、照合 NG・失敗の代わりに、黄色に月の印で「もう一度取る」を促す（Slack 取得と同じ）
     private func iconName(_ s: DisplayState) -> String {
         if store.sleepMissed { return "moon.fill" }
         switch s {
-        case .ok: return "checkmark"
+        case .ok: return unchecked(s) ? "questionmark" : "checkmark"
         case .running: return "arrow.clockwise"
         case .ng, .failed, .partial: return "exclamationmark"
         case .filling: return "hourglass"
@@ -1378,7 +1388,7 @@ struct StatusCard: View {
     private func iconBG(_ s: DisplayState) -> Color {
         if store.sleepMissed { return .warnIcon }
         switch s {
-        case .ok: return .okInk
+        case .ok: return unchecked(s) ? .warnIcon : .okInk
         case .running, .fresh: return .key
         case .ng, .failed, .login: return .ngInk
         case .stale, .waiting, .partial, .filling: return .warnIcon
@@ -1387,7 +1397,7 @@ struct StatusCard: View {
     private func wash(_ s: DisplayState) -> Color {
         if store.sleepMissed { return .warnWash }
         switch s {
-        case .ok: return .okWash
+        case .ok: return unchecked(s) ? .warnWash : .okWash
         case .running, .fresh: return .keyWash
         case .ng, .failed, .login: return .ngWash
         case .stale, .waiting, .partial, .filling: return .warnWash
@@ -1900,7 +1910,7 @@ private func dayLabel(_ date: String) -> String {
     return Fmt.string(d, "M/d")
 }
 /// マウスの位置の日（棒の吹き出しに使う）。日が 1 つも無いグラフでは聞かずに nil。
-/// Swift Charts は、日の並びが空のグラフで位置を聞くと落ちる（まだ一度も数えていないとき。2026-10-20 に別の PC で落ちた）
+/// Swift Charts は、日の並びが空のグラフで位置を聞くと落ちる（まだ一度も数えていないとき）
 func hoveredDay(_ proxy: ChartProxy, x: CGFloat, days: Int) -> String? {
     days > 0 ? proxy.value(atX: x, as: String.self) : nil
 }
@@ -2236,7 +2246,7 @@ struct RepoPanel: View {
             upcoming
 
             Rectangle().fill(Color.line).frame(height: 1)
-            Text("合計（\(fromText) から）").font(.system(size: 10, weight: .bold)).foregroundStyle(Color.ink3)
+            Text("合計（\(totalFromText)）").font(.system(size: 10, weight: .bold)).foregroundStyle(Color.ink3)
             LazyVGrid(columns: [GridItem(.flexible(), alignment: .leading), GridItem(.flexible(), alignment: .leading)],
                       alignment: .leading, spacing: 9) {
                 stat("入ったもの", Fmt.number(r.total) + "件")
@@ -2349,9 +2359,18 @@ struct RepoPanel: View {
         return "前の7日 \(Fmt.number(before))件より \(word)"
     }
 
-    private var fromText: String {
-        guard let s = r.from, let d = Fmt.parseJST(s + " 12:00:00") else { return "取り始めた日" }
+    private var fromText: String { dayText(r.from) ?? "取り始めた日" }
+
+    private func dayText(_ s: String?) -> String? {
+        guard let s, let d = Fmt.parseJST(s + " 12:00:00") else { return nil }
         return Fmt.string(d, "yyyy/M/d")
+    }
+
+    /// 合計の見出し。取り始める日を前にずらして、まだ古い分を足し終えていないあいだは、実際に数えた範囲の日を言う（設計書 7.5・Y-5）
+    private var totalFromText: String {
+        guard let c = dayText(r.counted_from) else { return "\(fromText) から" }
+        let filling = (r.pending ?? "").hasPrefix("古い分を足している途中")
+        return "\(c) から。\(fromText) からの分は" + (filling ? "足している途中です" : "次の取得で足します")
     }
 
     private var lastLanded: String {
@@ -2938,12 +2957,25 @@ struct StatusContent: View {
         }
     }
 
+    /// 照合の札の見出しの「いつの取得で確かめたか」。前の回の材料で確かめたリポジトリがあれば、そう言う（設計書 5 章・Y-2）
+    private var checkedWhen: String {
+        guard let d = Fmt.parseISO(store.file.check?.checked_at) else {
+            return "\(Fmt.relative(store.lastRunEnd, now: store.now)) の取得のあと"
+        }
+        var s = "\(Fmt.relative(d, now: store.now)) の取得で確かめた"
+        let old = store.file.check?.checked_old ?? []
+        if let first = old.first {
+            let oldest = old.compactMap { Fmt.parseISO($0.at) }.min()
+            s += "・\(first.repo)" + (old.count > 1 ? " ほか \(old.count - 1) つ" : "") + "は "
+                + (oldest.map { Fmt.relative($0, now: store.now) } ?? "前") + " の取得"
+        }
+        return s
+    }
+
     private var checkTip: some View {
         VStack(alignment: .leading, spacing: 8) {
             // いつの取得の材料で確かめたか（数え直しのあとも、材料の回を言う。設計書 5 章・10/21）
-            TipTitle(text: "照合で確かめていること（" + (Fmt.parseISO(store.file.check?.checked_at).map {
-                "\(Fmt.relative($0, now: store.now)) の取得で確かめた"
-            } ?? "\(Fmt.relative(store.lastRunEnd, now: store.now)) の取得のあと") + "）")
+            TipTitle(text: "照合で確かめていること（" + checkedWhen + "）")
             VStack(alignment: .leading, spacing: 7) {
                 ForEach(store.file.check?.items ?? []) { i in
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -3112,8 +3144,20 @@ enum Snapshot {
                 ou.file.check?.items?[j].state = "unverified"
             }
         }
+        // 1 つ目のカードは、取り始める日を前にずらした直後（合計の見出しは、実際に数えた範囲の日を言う。設計書 7.5・Y-5）。
+        // 照合の札の見出しは、前の回の材料で確かめたリポジトリがあれば、そう言う（設計書 5 章・Y-2）
+        if let first = ou.file.repos?.indices.first {
+            ou.file.repos?[first].counted_from = ou.file.repos?[first].from
+            ou.file.repos?[first].from = "2025-01-01"
+        }
+        if let tags = ou.file.repos?.map(\.tag), tags.count > 2, let d = ou.lastRunEnd {
+            ou.file.check?.checked_at = Fmt.iso.string(from: d)
+            ou.file.check?.checked_old = [CheckedOld(repo: tags[1], at: Fmt.iso.string(from: d.addingTimeInterval(-86400)))]
+        }
         render(PopoverView().environmentObject(ou), to: "\(dir)/menu_ok_unverified.png", width: 380)
         render(StatusContent().environmentObject(ou), to: "\(dir)/window_ok_unverified.png", width: 1000)
+        ou.previewTip = "check"
+        render(StatusContent().environmentObject(ou), to: "\(dir)/window_tip_check_old.png", width: 1000)
         // 最初の取得の途中に、読み切った小さいリポジトリで照合 NG があるとき。理由を見出しの下と小窓に出す（設計書 7.2・10/21）。
         // 取得の記録の 1 行目は、最初の取得の途中で上限に届いた回（「途中で止めた」と言わない）
         let fn = Store(live: false)
@@ -3384,7 +3428,7 @@ enum StateTest {
 
 enum ChartTest {
     /// 日が 1 つも無いグラフと、日のあるグラフで、マウスの位置を聞く所（hoveredDay）を試す。画面の外の窓で描くので、何も出ない。
-    /// 日が無いときに Swift Charts へ聞いてしまうと、この試しごと落ちる（2026-10-20 に別の PC で落ちた形）
+    /// 日が無いときに Swift Charts へ聞いてしまうと、この試しごと落ちる
     @MainActor
     static func run() -> Int32 {
         _ = NSApplication.shared

@@ -143,7 +143,7 @@ for tag, name, base, from_days, vis in REPOS:
                  pr_flags={"draft": 1, "changes_requested": 1, "approved": 1, "ci_failed": 1},
                  stages=[{"name": "確認環境", "branch": "staging", "behind": 9, "updated": iso(at(8, 18, 5))},
                          {"name": "本番", "branch": "production", "behind": 21, "updated": iso(at(18, 19, 30))}],
-                 counts={"prs": 64, "issues": 0, "comments": 212, "reviews": 71})
+                 counts={"prs": 58, "issues": 0, "comments": 212, "reviews": 71})
     elif tag == "窓":
         r.update(release={"tag": "v1.0.1", "date": iso(at(1, 1, 20)), "after": 0},
                  counts={"prs": 0, "issues": 0, "comments": 0, "reviews": 0})
@@ -164,7 +164,7 @@ json.dump([{"id": r["id"], "name": r["name"], "tag": r["tag"], "base": r["base"]
 daily = [{"date": str(DAYS[i]), "counts": daily_counts[i], "pr": daily_pr[i]} for i in range(14)]
 landed_total = sum(r["total"] for r in repos)
 items = [
-    {"name": "ページの取りこぼし", "ok": True, "detail": "一覧を最後のページまで取れた（今回 214 ページ）・途中で切れたページ 0"},
+    {"name": "ページの取りこぼし", "ok": True, "detail": "一覧を最後のページまで取れた（今回 173 ページ）・途中で切れたページ 0"},
     {"name": "件数の突き合わせ", "ok": True,
      "detail": "PR 183・issue 141 が GitHub の数と一致。コメントの数も PR・issue ごとに一致（324 件を確かめた）"},
     {"name": "期間の抜け", "ok": True, "detail": "取り始めた日から最後の取得まで、すき間なし（%d リポジトリ・5 種類）" % len(repos)},

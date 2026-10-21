@@ -201,6 +201,15 @@ final class Setup: ObservableObject {
     private var inspectTried: Set<Int> = []
     /// 準備の処理が動いているか（自己試験が、全部終わるまで待つのに使う）
     var helperRunning: Bool { process != nil || !waiting.isEmpty }
+    /// 選んだリポジトリの見込みの言葉。見込みを調べたが届かなかったものは、そう言う（1 度調べたものは自分からは
+    /// 調べ直さず、保存しても調べない。チェックを付け直すと調べ直す。設計書 4.9・Y-7。前は「見込みは保存のあとに」）
+    func estimateLabel(_ p: PickedRepo) -> String {
+        if inspecting.contains(p.id) { return "見込みを調べています…" }
+        if p.estimateNow == nil && inspectTried.contains(p.id) {
+            return "見込みを調べられませんでした（チェックを付け直すと、もう一度調べます）"
+        }
+        return Setup.estimateText(p.estimateNow)
+    }
 
     var busy: Bool { conn == .checking || searchingFor != nil }
 
@@ -1235,8 +1244,9 @@ struct PickedRow: View {
                 Spacer(minLength: 8)
                 // 保存してある（もう取っている）リポジトリには、最初の取得の見込みは出さない
                 if p.fromKind != .saved {
-                    Text(setup.inspecting.contains(p.id) ? "見込みを調べています…" : Setup.estimateText(p.estimateNow))
+                    Text(setup.estimateLabel(p))
                         .font(.system(size: 11)).foregroundStyle(Color.ink3).monospacedDigit()
+                        .lineLimit(2).multilineTextAlignment(.trailing)
                 }
                 Button { setup.remove(p.id) } label: {
                     Image(systemName: "xmark").font(.system(size: 11, weight: .bold)).foregroundStyle(Color.ink3)
@@ -1536,8 +1546,8 @@ enum SetupSnapshot {
                           hint: BaseHint(), estimate: Estimate(all: 3600, days90: 400)),
             RepoCandidate(id: 600001111, name: "sample-org/web-app", isPrivate: true, archived: false, fork: false,
                           default_branch: "main", branches: ["main", "develop", "staging", "production"], created: "2025-11-04",
-                          pushed: ago(2), description: "会員向けのウェブアプリ", prs: 64, issues: 0, commits: 1210,
-                          hint: BaseHint(suggested: "develop", default_quiet_since: dayAgo(81), pushes30: 69),
+                          pushed: ago(2), description: "会員向けのウェブアプリ", prs: 58, issues: 0, commits: 1210,
+                          hint: BaseHint(suggested: "develop", default_quiet_since: dayAgo(81), pushes30: 41),
                           estimate: Estimate(all: 820, days90: 260)),
             RepoCandidate(id: 600002222, name: "sample-user/menu-bar-app", isPrivate: false, archived: false, fork: false,
                           default_branch: "main", branches: ["main"], created: dayAgo(1), pushed: ago(1),
@@ -1754,7 +1764,7 @@ enum SetupTest {
             // 既定のブランチが止まっていれば、注意を出し、押すと勧めるブランチになる
             s.candidates.append(RepoCandidate(id: 1010, name: "test-owner/quiet-main", default_branch: "main",
                                               branches: ["main", "develop"], created: "2024-01-01",
-                                              hint: BaseHint(suggested: "develop", default_quiet_since: "2026-07-29", pushes30: 69)))
+                                              hint: BaseHint(suggested: "develop", default_quiet_since: "2026-07-29", pushes30: 41)))
             s.toggle(s.candidates[2])
             check("既定の main が止まっていれば、注意が出る（基準はまだ main）",
                   s.picked.first { $0.id == 1010 }.map { $0.baseWarning && $0.base == "main" } == true)
@@ -1799,6 +1809,32 @@ enum SetupTest {
                   queuedBoth && asked == ["test-owner/first", "test-owner/second"] && s.inspecting.isEmpty)
             check("順番を待った 2 つ目も見込みが届き、大きいので「90日前から」に選び直す",
                   s.picked.first { $0.id == 1022 }?.estimate?.all == 9000 && s.picked.first { $0.id == 1022 }?.fromKind == .days90)
+
+            // 見込みを調べたが届かなかった（GitHub につながらない形の台本）→「見込みを調べられませんでした」。チェックを付け直すと調べ直す（Y-7・10/21）
+            let failStub = """
+            import datetime, json, os, sys
+            d = os.environ["GITHUB_FETCH_DATA"]
+            p = os.path.join(d, "リポジトリ候補.json")
+            f = json.load(open(p, encoding="utf-8")) if os.path.exists(p) else {}
+            f["last"] = {"mode": "inspect", "at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"), "ok": False,
+                         "error": "GitHub につながりませんでした"}
+            json.dump(f, open(p, "w", encoding="utf-8"), ensure_ascii=False)
+            sys.exit(1)
+            """
+            try failStub.write(to: Paths.script, atomically: true, encoding: .utf8)
+            try "{\"repos\": [{\"id\": 1031, \"name\": \"test-owner/offline\", \"created\": \"2020-01-01\"}]}"
+                .write(to: Paths.candidates, atomically: true, encoding: .utf8)
+            s.closeNow(); s.open()
+            if let c = s.candidates.first(where: { $0.id == 1031 }) { s.toggle(c) }
+            waitHelpers()
+            let failedLabel = s.picked.first { $0.id == 1031 }.map { s.estimateLabel($0) } ?? ""
+            check("見込みが届かなかったリポジトリは「見込みを調べられませんでした」（「保存のあとに」と言わない）: \(failedLabel)",
+                  failedLabel.hasPrefix("見込みを調べられませんでした"))
+            try stub.write(to: Paths.script, atomically: true, encoding: .utf8)
+            if let c = s.candidates.first(where: { $0.id == 1031 }) { s.toggle(c); s.toggle(c) }   // チェックを付け直す
+            waitHelpers()
+            let retried = s.picked.first { $0.id == 1031 }.map { s.estimateLabel($0) } ?? ""
+            check("チェックを付け直すと、もう一度調べて見込みが届く: \(retried)", retried.hasPrefix("見込み 約"))
 
             // 記録のファイル: 2つが同時に書いても上書きしない（Slack 取得で 2026-10-09 に起きた順番を再現）
             guard let first = Store.appLog("状況の数え直し"), let second = Store.appLog("取得") else {
